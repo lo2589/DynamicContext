@@ -1,0 +1,25 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Local analysis/runtime state
+.codedendrite/
+.code_genome_db.json
+.code_hash_db.json
+.llm-scheduler/
+
+# Local backups
+backup/
+main copy.py
+task/sa-1_backup/
+task/sa-1/_backup_before_reparse_0730_0523/
+
+# Task/config data is private by default. Only sanitized standard examples ship.
+task/*
+!task/standard/
+!task/standard/**
+config/*
+!config/standard/
+!config/standard/**

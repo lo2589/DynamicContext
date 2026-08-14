@@ -1,0 +1,2 @@
+{"id":0,"content":{"system":{"content":"You are a concise assistant.","range":[[[1,null],1.0,"none"]]}}}
+{"id":1,"content":{"user":{"content":"Reply with a short greeting.","range":[[[1,null],1.0,"none"]]},"think":{"content":"1","range":[[[1,1],1.0,"none"]]},"assistant":{"content":"id: 1","range":[[[1,null],1.0,"none"]]}}}

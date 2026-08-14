@@ -1,0 +1,7 @@
+{
+  "provider": "glm",
+  "model": "your-model-name",
+  "base_url": "https://example.invalid/v1",
+  "api_key_env": "YOUR_PROVIDER_API_KEY",
+  "timeout": 300
+}

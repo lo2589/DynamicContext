@@ -1,0 +1,123 @@
+name: standard
+
+provider:
+  type: dry-run
+  config: provider.json
+
+chat:
+  type: normal
+  tools: none
+  search: none
+
+answer:
+  parser: normal
+  outputs:
+    think:
+      role: assistant
+    assistant:
+      role: assistant
+
+input_data:
+  type: real_user
+  path: null
+  interface: input
+
+life_cycle:
+  system: [1, null]
+  user: [born, null]
+  think: [born, born]
+  assistant: [born, null]
+
+compact:
+  fields: [user, assistant, think]
+  overload_threshold_bytes: 32000
+  compressors:
+    summary:
+      prompt: "Summarize only the useful facts, conclusions, and open items from this conversation: {content}"
+      periodic:
+        interval_turns: 20
+        keep_recent_turns: 10
+
+dataset:
+  type: local
+  kwargs:
+    path: ../../task/standard
+    tables:
+      history: history.jsonl
+      state: state_latest.json
+      context: context_latest.json
+      life_cycle: life_cycle.json
+      patches: patches.jsonl
+      compression: compression
+      raw: raw_history.jsonl
+
+rolling_front_params: &rolling_front_params
+  m: 20
+  k: 10
+  keep_recent_raw_turns: 10
+  elements: [user, answer]
+  density: 0.3
+  compressor: summary
+  drop_temporary_retained: true
+
+recall: &recall
+  type: none
+  build: none
+  recall: none
+  update: none
+  trigger: manual
+
+runtime:
+  system:
+    content: You are a concise assistant.
+    range: [[[1, null], 1.0, none]]
+  stream: true
+  print:
+    type: tables
+  lifecycle: [begin_turn, llm_call, end_turn]
+  pipeline:
+    begin_turn:
+      - clean: context.clean
+      - forward: memory.forward
+    llm_call:
+      - recall: *recall
+      - llm: provider.chat
+    end_turn:
+      - archive: memory.archive
+      - compat_check: memory.compat
+
+context:
+  state_model: field_turn_table
+  selector: none
+  required_elements: [user, assistant]
+  roles:
+    goal: user
+    constraint: user
+    answer: assistant
+  patch_end:
+    enabled: true
+    template: "以上{element}已经结束，不再继续执行：{content}。请按当前用户请求正常回答。"
+  type: stateful_archive
+  registry: memory_registry.json
+  restorer: mechanical
+  keep_history: true
+  lifecycles:
+    goal: temporary_retained_goal
+    constraint: rolling_single
+    user: persistent_once
+    answer: persistent_once
+    think: ephemeral
+    tool_call: ephemeral
+    tool_result: ephemeral
+    memory_state: rolling_single
+  patches: {}
+  clean:
+    system_cycle: context.lifecycles
+  compat:
+    trigger: before_context
+    policy: rolling_front_compress
+    <<: *rolling_front_params
+  forward:
+    order: [system, active_elements, dialogue_history, current_user]
+    include_roles: [system, user, assistant, memory]
+    use_active_compression_state: true

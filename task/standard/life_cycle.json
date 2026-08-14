@@ -1,0 +1,6 @@
+{
+  "system": [1, null],
+  "user": ["born", "permanent"],
+  "think": ["born", "born"],
+  "assistant": ["born", "permanent"]
+}
