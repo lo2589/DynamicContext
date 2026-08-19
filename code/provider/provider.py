@@ -21,7 +21,6 @@ DEFAULT_CONFIG_PATH = CONFIG_DIR / "provider.json"
 DEFAULT_OLLAMA_MODEL = "RogerBen/HY-MT2-1.8B:latest"
 
 PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
-    "dry-run": {"base_url": "", "model": "dry-run"},
     "deepseek": {
         "base_url": "https://api.deepseek.com",
         "model": "deepseek-chat",
@@ -94,7 +93,7 @@ class ProviderConfig:
             raise ValueError("provider thinking must be an object")
         if not model:
             raise ValueError("provider model cannot be empty")
-        if provider != "dry-run" and not base_url:
+        if not base_url:
             raise ValueError("provider base_url cannot be empty")
         if provider in {"deepseek", "glm", "minimax"} and not api_key:
             sources = []
@@ -296,19 +295,6 @@ def _render_message(message: dict[str, Any]) -> str:
     return f"<think>{think}</think>{content}" if think else content
 
 
-@provider_registry("client.dry-run")
-class DryRunProvider:
-    def __init__(self, config: ProviderConfig | None = None):
-        del config
-
-    def chat(self, context: Any, *, turn_id: int | str, **_: Any) -> str:
-        _messages(context)
-        return f"<think>{turn_id}</think> id：{turn_id}"
-
-    def chat_stream(self, context: Any, *, turn_id: int | str, **_: Any) -> Iterator[str]:
-        yield self.chat(context, turn_id=turn_id)
-
-
 @provider_registry("client.deepseek")
 @provider_registry("client.glm")
 @provider_registry("client.minimax")
@@ -428,12 +414,6 @@ def build_provider(config: ProviderConfig):
 
 def load_provider(name: str | Path | None = None):
     return build_provider(load_provider_config(name))
-
-
-@provider_registry("cfg.dry-run")
-def _build_dry_run_from_cfg(cfg: Any):
-    del cfg
-    return DryRunProvider()
 
 
 @provider_registry("cfg.deepseek")

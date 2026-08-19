@@ -1,7 +1,7 @@
 name: standard
 
 provider:
-  type: dry-run
+  type: ollama
   config: provider.json
 
 chat:

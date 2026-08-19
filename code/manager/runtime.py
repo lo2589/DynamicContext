@@ -1834,6 +1834,28 @@ def _self_test() -> None:
 
     from ..dataset.load_config import DEFAULT_CONFIG_PATH, load_config
 
+    class StubProvider:
+        """Deterministic offline answer, for tests only.
+
+        This used to be a registered vendor ("dry-run") any YAML could
+        select, which meant a real session could silently be answering with
+        fabricated text. It is gone from the registry; what the tests
+        actually need is not a vendor but a predictable reply, so the stub
+        lives here and is injected through build_runtime(provider_instance=…)
+        — no config can reach it, and the suite still runs offline and fast
+        instead of depending on a model being pulled.
+        """
+
+        def chat(self, context: Any, *, turn_id: int | str, **_: Any) -> str:
+            return f"<think>{turn_id}</think> id：{turn_id}"
+
+        def chat_stream(self, context: Any, *, turn_id: int | str, **_: Any):
+            yield self.chat(context, turn_id=turn_id)
+
+    def build_stub_runtime(cfg: Any, **kwargs: Any) -> "RuntimeComponents":
+        kwargs.setdefault("provider_instance", StubProvider())
+        return build_runtime(cfg, **kwargs)
+
     class InterruptedProvider:
         def chat_stream(self, *_args: Any, **_kwargs: Any):
             yield "<think>partial"
@@ -1855,7 +1877,7 @@ def _self_test() -> None:
             encoding="utf-8",
         )
         cfg = load_config(config_path)
-        runtime = build_runtime(cfg)
+        runtime = build_stub_runtime(cfg)
         assert runtime.tables.paths.history.name == "configured-history.jsonl"
         assert runtime.tables.paths.history.is_file()
         assert not (runtime.tables.paths.root / "history.jsonl").exists()
@@ -1865,7 +1887,7 @@ def _self_test() -> None:
         content_patch = runtime.input_data.next()
         assert isinstance(content_patch, ContentPatch)
         runtime.queue_patch(content_patch)
-        dry_run_provider = runtime.provider
+        stub_provider = runtime.provider
         runtime.provider = FailedProvider()
         try:
             runtime.process_turn("not committed")
@@ -1875,7 +1897,7 @@ def _self_test() -> None:
             raise AssertionError("provider失败后本轮没有回滚")
         assert "1" not in runtime.tables.history
         assert runtime.patches_for_turn(1) == [content_patch]
-        runtime.provider = dry_run_provider
+        runtime.provider = stub_provider
         parsed = runtime.process_turn("hello")
         assert parsed.think == "1"
         assert parsed.assistant == "id：1"
@@ -1894,7 +1916,7 @@ def _self_test() -> None:
         }
 
         resumed_cfg = load_config(config_path)
-        resumed = build_runtime(resumed_cfg)
+        resumed = build_stub_runtime(resumed_cfg)
         assert resumed.tables.history == runtime.tables.history
         assert resumed.tables.state == runtime.tables.state
         resumed.input_data.push_user("/goal replace runtime roll 2")
@@ -1912,7 +1934,7 @@ def _self_test() -> None:
         assert resumed.tables.history["3"]["goal"]["range"][0][0][1] == 3
         assert resumed.tables.state["3"]["goal"] == 1
 
-        resumed = build_runtime(load_config(config_path))
+        resumed = build_stub_runtime(load_config(config_path))
         assert resumed.tables.history["1"]["goal"]["range"][0][0][1] == 1
         assert resumed.tables.history["2"]["goal"]["content"] == "replace runtime"
         assert resumed.tables.history["3"]["goal"]["content"] == "replace runtime"
@@ -1942,7 +1964,7 @@ def _self_test() -> None:
         # closed goal as a fresh candidate every turn after that, since "no
         # longer active" looked identical to "never announced" — recreating
         # goal_end forever. Two more turns must not add a second one.
-        resumed.provider = dry_run_provider
+        resumed.provider = stub_provider
         resumed.process_turn("still going")
         assert "goal_end" not in resumed.tables.history["5"]
         assert resumed.tables.state["4"]["goal_end"] == 0  # itself expired
@@ -1963,7 +1985,7 @@ def _self_test() -> None:
             encoding="utf-8",
         )
         cfg = load_config(config_path)
-        runtime = build_runtime(cfg)
+        runtime = build_stub_runtime(cfg)
 
         runtime.process_turn("turn one")
         runtime.process_turn("turn two")
@@ -2016,7 +2038,7 @@ def _self_test() -> None:
         )
         cfg = load_config(config_path)
         assert cfg.to_dict()["compact"]["fields"] == ["assistant"]
-        runtime = build_runtime(cfg)
+        runtime = build_stub_runtime(cfg)
         for index in range(4):
             runtime.process_turn(f"turn {index}")
         assert _last_summary_turn(runtime.tables.history) == 3
@@ -2046,7 +2068,7 @@ def _self_test() -> None:
             encoding="utf-8",
         )
         cfg = load_config(config_path)
-        runtime = build_runtime(cfg)
+        runtime = build_stub_runtime(cfg)
         for index in range(6):
             runtime.process_turn(f"turn {index}")
         assert _last_summary_turn(runtime.tables.history) is None
@@ -2066,7 +2088,7 @@ def _self_test() -> None:
             encoding="utf-8",
         )
         cfg = load_config(config_path)
-        runtime = build_runtime(cfg)
+        runtime = build_stub_runtime(cfg)
         runtime.input_data.push_user("/goal ship feature remain 2")
         goal_patch = runtime.input_data.next()
         assert isinstance(goal_patch, ContentPatch)
@@ -2103,7 +2125,7 @@ def _self_test() -> None:
             encoding="utf-8",
         )
         cfg = load_config(config_path)
-        runtime = build_runtime(cfg)
+        runtime = build_stub_runtime(cfg)
         runtime.input_data.push_user("hello")
         runtime.input_data.push_user("/check")
         runtime.input_data.close()
@@ -2129,7 +2151,7 @@ def _self_test() -> None:
             encoding="utf-8",
         )
         cfg = load_config(config_path)
-        runtime = build_runtime(cfg)
+        runtime = build_stub_runtime(cfg)
         runtime.input_data.push_user("/pin 现在还没有轮次")
         no_turn_pin = runtime.input_data.next()
         assert isinstance(no_turn_pin, PinCommand)
@@ -2183,7 +2205,7 @@ def _self_test() -> None:
             encoding="utf-8",
         )
         cfg = load_config(config_path)
-        runtime = build_runtime(cfg)
+        runtime = build_stub_runtime(cfg)
         runtime.provider = PinningProvider(
             [
                 "<think>noting</think>"

@@ -12,7 +12,6 @@ from .provider import (
     DEFAULT_OLLAMA_MODEL,
     PROVIDER_DEFAULTS,
     ProviderConfig,
-    build_provider,
     load_provider,
     load_provider_config,
     save_provider_config,
@@ -33,9 +32,6 @@ def parse(argv: Any = None) -> argparse.Namespace:
 
     show = commands.add_parser("show", help="load and display the saved config")
     show.add_argument("--config-name", default="provider.json")
-
-    dry = commands.add_parser("dry-run", help="return deterministic turn id output")
-    dry.add_argument("--turn-id", required=True)
 
     chat = commands.add_parser("chat", help="load saved config and send one user message")
     chat.add_argument("message")
@@ -92,12 +88,6 @@ def main(argv: Any = None) -> None:
             "timeout": config.timeout,
         }
         print(json.dumps(visible, ensure_ascii=False, indent=2))
-        return
-    if args.command == "dry-run":
-        provider = build_provider(
-            ProviderConfig("dry-run", "dry-run")
-        )
-        print(provider.chat([], turn_id=args.turn_id))
         return
     if args.command == "chat":
         provider = load_provider(args.config_name)

@@ -734,8 +734,8 @@ def _self_test() -> None:
             recall_preview=lambda query: [f"echo:{query}"],
             compress_status=lambda: {"enabled": True, "current_turn": 3},
             model_status=lambda: {
-                "current": {"provider": "dry-run", "model": "dry-run"},
-                "vendors": {"dry-run": {"base_url": "", "model": "dry-run"}},
+                "current": {"provider": "ollama", "model": "qwen3:8b"},
+                "vendors": {"ollama": {"base_url": "http://127.0.0.1:11434", "model": "qwen3:8b"}},
                 "saved": [],
             },
             model_switch=_fake_switch,
@@ -772,8 +772,8 @@ def _self_test() -> None:
             # Model picker: list, switch, and a rejected switch.
             with opener.open(f"http://127.0.0.1:{port}/models") as response:
                 models = json.loads(response.read())
-            assert models["current"]["provider"] == "dry-run"
-            assert "dry-run" in models["vendors"]
+            assert models["current"]["provider"] == "ollama"
+            assert "ollama" in models["vendors"]
             status, reply = post("/model", {"provider": "glm", "model": "GLM-4.5-Air"})
             assert status == 200 and reply["ok"] is True
             assert switched[-1]["model"] == "GLM-4.5-Air"

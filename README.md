@@ -104,7 +104,7 @@ compact     summary / sum / goal_collapse / retain.last_k / retain.keep_all / re
 recall      grep / trigger.always / trigger.manual / trigger.never / trigger.pattern / none
 patch       add_row / cell / create / forward / force_refresh / reset_from_now / content.for_turn / content.pending_after / input.extract / input.parse / row / yaml.write
 dataset     input.type.* / input.interface.* / storage.local / config.load / history.* / context.resume …
-provider    client.deepseek / client.glm / client.minimax / client.ollama / client.dry-run / cfg.* / chat.normal / chat.no_stream / answer.parse.normal / answer.parse.tagged / tools.none / search.none
+provider    client.deepseek / client.glm / client.minimax / client.ollama / cfg.* / chat.normal / chat.no_stream / answer.parse.normal / answer.parse.tagged / tools.none / search.none
 saver       history.save / state.save / context.save / life_cycle.save / patch.append / raw.append / print.tables / print.none
 manager     tables.initialize / runtime.build / runtime.run / lifecycle.fixed / context.select.none
 ```
@@ -118,11 +118,14 @@ manager     tables.initialize / runtime.build / runtime.run / lifecycle.fixed / 
 ```bash
 python3 -m code.provider init      # 交互式创建一份新配置
 python3 -m code.provider show      # 查看已保存的配置（不显示 key 原文）
-python3 -m code.provider dry-run --turn-id 5     # 固定返回 <think>5</think> id：5，不用真的调用
 python3 -m code.provider chat "只回答 OK" --turn-id 1   # 用某份配置发一次真实请求
 ```
 
-支持的厂商：`dry-run` / `glm` / `deepseek` / `minimax` / `ollama`。
+支持的厂商：`glm` / `deepseek` / `minimax` / `ollama`。
+
+没有假回复模式：能选的每一个厂商都会真的发请求。测试用的确定性桩只存在于
+`code/manager/runtime.py` 的自测里，通过 `build_runtime(provider_instance=…)` 注入，
+任何 yaml 都够不着它。
 
 ## 压缩、回捞、钉住
 
