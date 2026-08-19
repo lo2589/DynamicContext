@@ -131,6 +131,7 @@ class Handler(BaseHTTPRequestHandler):
         interrupt: Callable[[], dict] | None = None,
         settings_read: Callable[[], dict] | None = None,
         settings_write: Callable[[dict], dict] | None = None,
+        turn_action: Callable[[dict], dict] | None = None,
         **kwargs,
     ) -> None:
         self.task_dir = task_dir
@@ -145,6 +146,7 @@ class Handler(BaseHTTPRequestHandler):
         self.interrupt = interrupt
         self.settings_read = settings_read
         self.settings_write = settings_write
+        self.turn_action = turn_action
         super().__init__(*args, **kwargs)
 
     def _send(self, payload: bytes, mime: str, *, status: int = 200) -> None:
@@ -391,6 +393,9 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, AssertionError) as exc:
                 self._send_json({"error": str(exc)}, status=400)
             return
+        if path == "/turn":
+            self._handle_turn_action()
+            return
         if path == "/new-run":
             from .launcher import ensure_launcher
 
@@ -443,6 +448,21 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send_json({"results": self.recall_preview(query)})
 
+    def _handle_turn_action(self) -> None:
+        if self.turn_action is None:
+            self._send_json({"error": "此页面没有接到可写入的 runtime"}, status=503)
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            payload = json.loads(self.rfile.read(length) or b"{}")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._send_json({"error": "invalid JSON body"}, status=400)
+            return
+        try:
+            self._send_json(self.turn_action(payload if isinstance(payload, dict) else {}))
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+
     def _handle_model_switch(self) -> None:
         if self.model_switch is None:
             self._send_json({"error": "此页面没有接到可写入的 runtime"}, status=503)
@@ -485,6 +505,7 @@ def build_server(
     interrupt: Callable[[], dict] | None = None,
     settings_read: Callable[[], dict] | None = None,
     settings_write: Callable[[dict], dict] | None = None,
+    turn_action: Callable[[dict], dict] | None = None,
 ) -> ThreadingHTTPServer:
     if not VIEWER.is_file():
         raise SystemExit(f"{VIEWER} 不存在")
@@ -503,6 +524,7 @@ def build_server(
         interrupt=interrupt,
         settings_read=settings_read,
         settings_write=settings_write,
+        turn_action=turn_action,
     )
     return ThreadingHTTPServer(("127.0.0.1", port), handler)
 
@@ -526,6 +548,7 @@ def start_viewer(
     interrupt: Callable[[], dict] | None = None,
     settings_read: Callable[[], dict] | None = None,
     settings_write: Callable[[dict], dict] | None = None,
+    turn_action: Callable[[dict], dict] | None = None,
 ) -> ThreadingHTTPServer:
     """Serve the live viewer for ``task_dir`` in a background thread.
 
@@ -549,6 +572,7 @@ def start_viewer(
         interrupt=interrupt,
         settings_read=settings_read,
         settings_write=settings_write,
+        turn_action=turn_action,
     )
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{port}/"
@@ -599,8 +623,8 @@ _JS_GLOBALS = frozenset({
     "fetch", "setInterval", "clearInterval", "setTimeout", "clearTimeout",
     "parseInt", "parseFloat", "String", "Number", "Boolean", "Array", "Object",
     "JSON", "Math", "Date", "Error", "Set", "Map", "Promise", "RegExp",
-    "document", "window", "location", "console", "isNaN", "alert",
-    "encodeURIComponent", "decodeURIComponent", "FileReader",
+    "document", "window", "location", "console", "isNaN", "alert", "confirm",
+    "encodeURIComponent", "decodeURIComponent", "FileReader", "MutationObserver",
     # viewer.html's own, which the injected scripts are appended after.
     "load", "setTurn", "stop", "render", "parse", "pick", "readFile",
 })

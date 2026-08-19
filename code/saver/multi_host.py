@@ -334,6 +334,14 @@ class HostHandler(BaseHTTPRequestHandler):
                 return
             self._json({"results": bundle["recall_preview"](query)})
             return
+        if tail == "/turn":
+            from . import turn_control
+
+            try:
+                self._json(turn_control.apply_action(session.runtime, self._body()))
+            except ValueError as exc:
+                self._json({"error": str(exc)}, status=400)
+            return
         if tail in ("/model", "/settings"):
             action = bundle["model_switch"] if tail == "/model" else bundle["settings_write"]
             try:

@@ -48,3 +48,16 @@
   background:transparent;color:var(--live);font:inherit;font-size:11px;cursor:pointer}
 #live-new:hover{background:var(--live);color:var(--paper)}
 #live-new:disabled{opacity:.5;cursor:default}
+
+/* Per-turn controls, injected into the transcript's turn markers. A turn can
+   be taken out of the model's view without touching what it says, or killed
+   outright — two different acts, so two different buttons. */
+.turnmark{position:relative}
+.turn-ops{display:inline-flex;gap:5px;margin-left:9px;vertical-align:middle}
+.turn-ops button{padding:1px 7px;border:1px solid var(--rule);border-radius:99px;
+  background:transparent;color:var(--ink-2);font:inherit;font-size:9.5px;
+  letter-spacing:.04em;cursor:pointer;line-height:1.6}
+.turn-ops button:hover{border-color:var(--live);color:var(--live)}
+.turn-ops button.kill:hover{border-color:var(--mark);color:var(--mark)}
+.turn-ops button:disabled{opacity:.4;cursor:default}
+.turn-ops .said{color:var(--ink-2);font-size:9.5px;margin-left:2px}

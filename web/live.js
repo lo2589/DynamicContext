@@ -539,3 +539,89 @@
 
   refresh()
 })()
+
+// ---- per-turn visibility: hide / restore / kill ----
+// The viewer renders the transcript as "turn N" markers followed by that
+// turn's bubbles, and rewrites #chat wholesale on every draw. So the controls
+// are re-injected after each draw rather than placed once — an observer, not
+// a one-time pass — which also means viewer.html itself needs no change.
+;(function () {
+  if (!window.__live.writable) return
+
+  var chat = document.getElementById("chat")
+  if (!chat) return
+
+  function turnOf(marker) {
+    var m = /(\d+)/.exec(marker.textContent || "")
+    return m ? parseInt(m[1], 10) : null
+  }
+
+  function act(action, turn, marker) {
+    var ops = marker.querySelector(".turn-ops")
+    function enable(state) {
+      if (ops) Array.prototype.forEach.call(ops.querySelectorAll("button"), function (b) { b.disabled = state })
+    }
+    // Re-enabled when the request settles. Leaving them disabled and waiting
+    // for the next redraw to replace them means a turn whose transcript did
+    // not change keeps a row of dead buttons.
+    enable(true)
+    fetch("turn", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: action, turn: turn }),
+    })
+      .then(function (r) { return r.json().then(function (d) { if (!r.ok) throw new Error(d.error); return d }) })
+      .then(function (d) {
+        // A refusal is information, not a failure: think that is declared
+        // [born, born] is finished by its own rule, and a killed record does
+        // not come back from a button.
+        var refused = d.refused ? Object.keys(d.refused) : []
+        if (refused.length) {
+          var first = d.refused[refused[0]]
+          say(marker, refused.join("/") + "：" + first)
+        }
+        return window.__liveTick()
+      })
+      .then(function () { refreshTokens && refreshTokens() })
+      .catch(function (e) { say(marker, "失败：" + e.message) })
+      .then(function () { enable(false) })
+  }
+
+  function say(marker, text) {
+    var note = marker.querySelector(".said")
+    if (!note) return
+    note.textContent = text
+    setTimeout(function () { if (note) note.textContent = "" }, 6000)
+  }
+
+  function decorate() {
+    Array.prototype.forEach.call(chat.querySelectorAll(".turnmark"), function (marker) {
+      if (marker.querySelector(".turn-ops")) return
+      var turn = turnOf(marker)
+      if (turn === null || turn === 0) return  // turn 0 is the system prompt
+
+      var ops = document.createElement("span")
+      ops.className = "turn-ops"
+      ops.innerHTML =
+        '<button data-a="hide" title="从下一轮起不再进入上下文；内容保留在账本里，可恢复">不可见</button>' +
+        '<button data-a="show" title="重新进入上下文（声明已到期或已删除的槽位不会恢复）">恢复</button>' +
+        '<button data-a="delete" class="kill" title="标记为已删除并记在当前轮；账本保留记录，但按钮无法撤销">删除</button>' +
+        '<span class="said"></span>'
+      Array.prototype.forEach.call(ops.querySelectorAll("button"), function (button) {
+        button.onclick = function (event) {
+          event.stopPropagation()
+          var action = button.getAttribute("data-a")
+          if (action === "delete" &&
+              !confirm("删除第 " + turn + " 轮？\n\n账本会保留这条记录并标记为已删除，但恢复只能手动改 history.jsonl。")) {
+            return
+          }
+          act(action, turn, marker)
+        }
+      })
+      marker.appendChild(ops)
+    })
+  }
+
+  decorate()
+  new MutationObserver(decorate).observe(chat, { childList: true })
+})()

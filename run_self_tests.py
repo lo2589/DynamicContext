@@ -39,6 +39,7 @@ MODULES = (
     "code.saver.session_registry",
     "code.saver.launcher",
     "code.saver.multi_host",
+    "code.saver.turn_control",
 )
 
 

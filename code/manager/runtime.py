@@ -2033,6 +2033,9 @@ def run_runtime(runtime: RuntimeComponents) -> None:
                 interrupt=_interrupt(runtime),
                 settings_read=_settings_read(runtime),
                 settings_write=_settings_write(runtime),
+                turn_action=lambda payload: __import__(
+                    "code.saver.turn_control", fromlist=["apply_action"]
+                ).apply_action(runtime, payload),
             )
         except Exception as exc:  # noqa: BLE001 - a busy port must never stop a run
             print(f"[viewer skipped: {exc}]")
