@@ -80,7 +80,98 @@ def _options() -> dict[str, Any]:
         "port": _free_port(),
         "system": "You are a concise assistant.",
         "yaml_sources": _yaml_sources(),
+        "lifecycle_rules": LIFECYCLE_RULES,
+        "default_slots": DEFAULT_SLOTS,
+        "input_types": [
+            {"id": "real_user", "label": "我自己打字", "needs_path": False},
+            {"id": "user_only_json", "label": "数据集：每条一个提问", "needs_path": True},
+            {"id": "user_answer_json", "label": "数据集：提问+答案，从第一条没答案的续", "needs_path": True},
+            {"id": "json_then_user", "label": "数据集跑完再接手打字", "needs_path": True},
+        ],
+        "datasets": _datasets(),
     }
+
+
+def _datasets() -> list[str]:
+    """JSON files that could serve as an input dataset, repo-relative."""
+    found: list[str] = []
+    for base in (REPO_ROOT / "task", REPO_ROOT / "data", REPO_ROOT / "dataset"):
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob("*.json")):
+            # Outputs and bookkeeping, not input datasets: the fixed tables a
+            # run writes, the cross-session registry, and anything hidden.
+            if path.name in {"state_latest.json", "context_latest.json", "life_cycle.json"}:
+                continue
+            if any(part.startswith(".") for part in path.relative_to(REPO_ROOT).parts):
+                continue
+            if "snapshots" in path.parts:
+                continue
+            found.append(str(path.relative_to(REPO_ROOT)))
+    return found[:60]
+
+
+# Y-08. The declarations this runtime is actually about: which slots are on
+# stage, for how long. Every entry is a registered end-function
+# (code/lifecycle/rules.py), described in the terms a user picking one needs —
+# what it does to the timetable, and what it costs. Kept here rather than read
+# off the registry because the registry knows the functions, not what choosing
+# one means for the picture the viewer draws.
+LIFECYCLE_RULES = [
+    {
+        "id": "permanent",
+        "label": "一直在场",
+        "note": "写下就再也不退场；上下文只增不减",
+        "yaml": "null",
+    },
+    {
+        "id": "born",
+        "label": "只在出生那轮",
+        "note": "想完就扔，下一轮就看不见了（think 的默认）",
+        "yaml": "born",
+    },
+    {
+        "id": "born+n",
+        "label": "出生后再留 n 轮",
+        "note": "滑动窗口：n 轮后自动退场",
+        "yaml": "born+n",
+        "needs_n": True,
+    },
+    {
+        "id": "until_cancelled",
+        "label": "钉住，直到手动取消",
+        "note": "唯一不随距离衰减的机制；/cancelpin 才会撤下",
+        "yaml": "until_cancelled",
+    },
+    {
+        "id": "cycle",
+        "label": "被指回时缺席",
+        "note": "输入指回这一轮时它让位；需要数据集提供 linked_trap",
+        "yaml": "cycle",
+        "needs_dataset": True,
+    },
+    {
+        "id": "labelled",
+        "label": "按数据集标记决定",
+        "note": "打了标的按 born 结束，没打的永久；需要数据集提供 type",
+        "yaml": "labelled",
+        "needs_dataset": True,
+    },
+    {
+        "id": "until_goal_end",
+        "label": "直到所属 goal 结束",
+        "note": "goal 一收尾，它管辖的内容一起折叠",
+        "yaml": "until_goal_end",
+    },
+]
+
+# The slots a fresh run starts with. system is turn 0 and is declared as a
+# literal range, not an end-function, so it is not offered as a row.
+DEFAULT_SLOTS = [
+    {"element": "user", "rule": "permanent", "n": 3},
+    {"element": "think", "rule": "born", "n": 3},
+    {"element": "assistant", "rule": "permanent", "n": 3},
+]
 
 
 def _yaml_sources() -> list[dict[str, str]]:
@@ -188,6 +279,23 @@ def _preferred_model(installed: list[str]) -> str:
     return installed[0] if installed else ""
 
 
+def _rule_to_yaml(rule: str, n: int) -> str:
+    """A picked rule as the YAML bound the loader expects.
+
+    `permanent` is written as the empty value `null`, which is what an absent
+    end already means (code/lifecycle/rules.py: "Writing nothing is not naming
+    a function"). `born+n` carries its parameter in the name, which
+    resolve_bound splits back out — the parameter never becomes part of the
+    registered function's identity.
+    """
+
+    if rule == "permanent":
+        return "null"
+    if rule == "born+n":
+        return f"born+{max(1, int(n))}"
+    return rule
+
+
 def build_yaml(
     *,
     task: str,
@@ -196,8 +304,18 @@ def build_yaml(
     system: str,
     interface: str,
     port: int,
-    keep_think: bool,
     compact_on: bool,
+    slots: list[dict] | None = None,
+    input_type: str = "real_user",
+    input_path: str = "",
+    compact_interval: int = 20,
+    compact_keep_recent: int = 10,
+    compact_threshold: int = 32000,
+    compact_retention: str = "latest_only",
+    compact_prompt: str = "",
+    recall_on: bool = False,
+    recall_trigger: str = "always",
+    recall_top_k: int = 3,
 ) -> str:
     """Render the shipped template with the panel's answers substituted.
 
@@ -226,14 +344,95 @@ def build_yaml(
     text = re.sub(r"^    path: \.\./\.\./task/standard$", "    path: .", text, count=1, flags=re.M)
     text = re.sub(r"^    enabled: false.*$", "    enabled: true", text, count=1, flags=re.M)
     text = re.sub(r"^    port: 8777$", f"    port: {port}", text, count=1, flags=re.M)
-    if keep_think:
-        # think defaults to [born, born] — thought once, then dropped. Keeping
-        # it makes every turn's reasoning stay visible in later context.
-        text = re.sub(r"^  think: \[born, born\]$", "  think: [born, null]", text, count=1, flags=re.M)
+    # Y-05/Y-06: where the turns come from.
+    text = re.sub(r"^  type: real_user$", f"  type: {input_type}", text, count=1, flags=re.M)
+    if input_path:
+        text = re.sub(
+            r"^  path: null$",
+            f"  path: {json.dumps(input_path, ensure_ascii=False)}",
+            text,
+            count=1,
+            flags=re.M,
+        )
+
+    # Y-08: the whole life_cycle block, rewritten from the picked rules. system
+    # keeps its literal [1, null]: it is turn 0's slot, declared as a range
+    # rather than by an end-function.
+    if slots:
+        lines = ["life_cycle:", "  system: [1, null]"]
+        for slot in slots:
+            element = str(slot.get("element") or "").strip()
+            if not element or element == "system":
+                continue
+            bound = _rule_to_yaml(str(slot.get("rule") or "permanent"), slot.get("n") or 3)
+            lines.append(f"  {element}: [born, {bound}]")
+        if recall_on and not any(str(s.get("element")) == "recall" for s in slots):
+            # Enabling recall without declaring how long recalled evidence
+            # lives is refused at build_runtime; [born, born] (visible only for
+            # the turn that asked) is the documented example.
+            lines.append("  recall: [born, born]")
+        text = re.sub(
+            r"^life_cycle:\n(?:  .*\n)+",
+            "\n".join(lines) + "\n",
+            text,
+            count=1,
+            flags=re.M,
+        )
+
     if not compact_on:
         # `compact: none` is the documented off-switch, same convention as
         # chat.tools / recall.type.
         text = re.sub(r"^compact:\n(?:[ ].*\n|\n)*?(?=^\S)", "compact: none\n\n", text, count=1, flags=re.M)
+    else:
+        # Y-11~15
+        text = re.sub(
+            r"^  overload_threshold_bytes: \d+$",
+            f"  overload_threshold_bytes: {int(compact_threshold)}",
+            text, count=1, flags=re.M,
+        )
+        text = re.sub(
+            r"^        interval_turns: \d+$",
+            f"        interval_turns: {int(compact_interval)}",
+            text, count=1, flags=re.M,
+        )
+        text = re.sub(
+            r"^        keep_recent_turns: \d+$",
+            f"        keep_recent_turns: {int(compact_keep_recent)}",
+            text, count=1, flags=re.M,
+        )
+        if compact_prompt.strip():
+            text = re.sub(
+                r"^      prompt: .*$",
+                f"      prompt: {json.dumps(compact_prompt, ensure_ascii=False)}",
+                text, count=1, flags=re.M,
+            )
+        if compact_retention and compact_retention != "latest_only":
+            text = re.sub(
+                r"^      periodic:$",
+                f"      retention: {compact_retention}\n      periodic:",
+                text, count=1, flags=re.M,
+            )
+
+    # Y-16~19: recall is off in the template; turning it on also requires the
+    # searchable fields to be named, which build_runtime enforces.
+    if recall_on:
+        searchable = [
+            str(s.get("element"))
+            for s in (slots or [])
+            if str(s.get("element")) not in {"", "system", "think", "recall"}
+        ] or ["user", "assistant"]
+        text = re.sub(
+            r"^recall: &recall\n(?:  .*\n)+",
+            "recall: &recall\n"
+            "  type: grep\n"
+            f"  trigger: {recall_trigger}\n"
+            f"  search_fields: [{', '.join(searchable)}]\n"
+            f"  top_k: {int(recall_top_k)}\n"
+            "  build: none\n"
+            "  recall: none\n"
+            "  update: none\n",
+            text, count=1, flags=re.M,
+        )
     return text
 
 
@@ -265,7 +464,11 @@ def create_run(payload: dict) -> dict:
                 "api_key": str(payload.get("api_key") or ""),
             }
         )
-        config_name = f"{vendor}.json"
+        # B-01: one file per task, not per vendor. A shared "{vendor}.json"
+        # means two tasks on the same vendor point at the same file, so
+        # switching the model in one session silently rewrites the other's —
+        # a run's config has to belong to that run.
+        config_name = f"{task}.json"
         save_provider_config(config, config_name)
 
     port = int(payload.get("port") or _free_port())
@@ -317,8 +520,18 @@ def create_run(payload: dict) -> dict:
                 system=str(payload.get("system") or "You are a concise assistant."),
                 interface="gui" if payload.get("web_input", True) else "input",
                 port=port,
-                keep_think=bool(payload.get("keep_think")),
                 compact_on=bool(payload.get("compact", True)),
+                slots=payload.get("slots") or DEFAULT_SLOTS,
+                input_type=str(payload.get("input_type") or "real_user"),
+                input_path=str(payload.get("input_path") or ""),
+                compact_interval=int(payload.get("compact_interval") or 20),
+                compact_keep_recent=int(payload.get("compact_keep_recent") or 10),
+                compact_threshold=int(payload.get("compact_threshold") or 32000),
+                compact_retention=str(payload.get("compact_retention") or "latest_only"),
+                compact_prompt=str(payload.get("compact_prompt") or ""),
+                recall_on=bool(payload.get("recall")),
+                recall_trigger=str(payload.get("recall_trigger") or "always"),
+                recall_top_k=int(payload.get("recall_top_k") or 3),
             ),
             encoding="utf-8",
         )
@@ -442,6 +655,28 @@ button.go:disabled{opacity:.55;cursor:default}
 .msg{margin-top:11px;font-size:12px;color:var(--ink-2);min-height:1.3em;overflow-wrap:anywhere}
 .hint{font-size:11px;color:var(--ink-2);margin-top:4px;
   font-family:ui-sans-serif,system-ui,sans-serif}
+/* Y-08 is the point of this runtime, so it gets the room and the emphasis:
+   one row per slot, the rule spelled out in words, and a line saying what the
+   choice does to the timetable the viewer draws. */
+.lc{border:1px solid var(--live);border-radius:10px;padding:13px 14px 11px;margin-top:16px;
+  background:color-mix(in srgb, var(--live) 5%, transparent)}
+.lc h3{margin:0 0 3px;font-size:13px;font-family:ui-sans-serif,system-ui,sans-serif}
+.lc .why{color:var(--ink-2);font-size:11.5px;margin:0 0 11px;
+  font-family:ui-sans-serif,system-ui,sans-serif;line-height:1.55}
+.lc-row{display:grid;grid-template-columns:7.5rem 1fr auto;gap:8px;align-items:center;
+  margin-bottom:7px}
+.lc-row .el{font-size:12.5px;font-weight:600}
+.lc-row select{font-size:12px;padding:6px 8px}
+.lc-row .n{width:4.2rem;font-size:12px;padding:6px 8px}
+.lc-row .n[hidden]{display:none}
+.lc-note{grid-column:1/-1;color:var(--ink-2);font-size:10.5px;margin:-3px 0 4px;
+  font-family:ui-sans-serif,system-ui,sans-serif}
+.lc-add{display:flex;gap:7px;margin-top:9px}
+.lc-add input{flex:1;font-size:12px;padding:6px 8px}
+.lc-add button,.lc-row .del{font-size:11px;padding:5px 9px;border:1px solid var(--rule);
+  border-radius:6px;background:transparent;color:var(--ink-2);cursor:pointer}
+.lc-add button:hover,.lc-row .del:hover{border-color:var(--live);color:var(--live)}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px}
 #runs{display:flex;flex-direction:column;gap:6px;margin-bottom:20px}
 #runs:empty{display:none}
 .run{display:flex;align-items:center;gap:10px;padding:8px 11px;border:1px solid var(--rule);
@@ -493,11 +728,66 @@ button.go:disabled{opacity:.55;cursor:default}
   <label for="system">系统提示词</label>
   <textarea id="system" rows="2"></textarea>
 
+  <div class="two">
+    <div>
+      <label for="input-type">对话从哪来</label>
+      <select id="input-type"></select>
+    </div>
+    <div>
+      <label for="dataset">数据集文件</label>
+      <select id="dataset"><option value="">—</option></select>
+    </div>
+  </div>
+
+  <div class="lc">
+    <h3>生命周期 · 每个槽位在场多久</h3>
+    <p class="why">这是这个 runtime 的主张，也是右边格子图唯一的变量：同一段对话，
+    换一组声明就是完全不同的一张表。历史一个字不会变——变的只是谁还在上下文里。</p>
+    <div id="lc-rows"></div>
+    <div class="lc-add">
+      <input id="lc-new" placeholder="新槽位名字（例如 goal、note）" autocomplete="off">
+      <button type="button" id="lc-add-btn">＋ 加一行</button>
+    </div>
+  </div>
+
   <div class="checks">
     <label><input type="checkbox" id="web-input" checked> 在网页里聊天</label>
     <label><input type="checkbox" id="compact" checked> 自动压缩</label>
-    <label><input type="checkbox" id="keep-think"> 保留 think</label>
+    <label><input type="checkbox" id="recall"> 开启回捞</label>
   </div>
+
+  <details>
+    <summary>压缩参数（默认要聊满 30 轮才触发一次）</summary>
+    <div class="grid3">
+      <div><label for="c-interval">每隔几轮</label><input id="c-interval" value="20"></div>
+      <div><label for="c-keep">保留最近几轮</label><input id="c-keep" value="10"></div>
+      <div><label for="c-threshold">超过多少字节</label><input id="c-threshold" value="32000"></div>
+    </div>
+    <label for="c-retention">摘要保留策略</label>
+    <select id="c-retention">
+      <option value="latest_only">只留最新一份</option>
+      <option value="keep_all">全部保留</option>
+      <option value="last_k">保留最近 k 份</option>
+      <option value="equidistant">等距抽 k 份</option>
+    </select>
+    <label for="c-prompt">摘要提示词（留空用默认）</label>
+    <textarea id="c-prompt" rows="2" placeholder="留空则用模板里的默认提示词"></textarea>
+  </details>
+
+  <details>
+    <summary>回捞参数（勾了「开启回捞」才生效）</summary>
+    <div class="two">
+      <div>
+        <label for="r-trigger">什么时候捞</label>
+        <select id="r-trigger">
+          <option value="always">每轮都捞</option>
+          <option value="pattern">匹配到关键词才捞</option>
+          <option value="never">从不</option>
+        </select>
+      </div>
+      <div><label for="r-topk">最多捞回几条</label><input id="r-topk" value="3"></div>
+    </div>
+  </details>
 
   <details>
     <summary>更多（已保存的配置 / 密钥 / 地址 / 端口）</summary>
@@ -536,7 +826,70 @@ fetch("/options").then(function (r) { return r.json() }).then(function (d) {
   syncVendor()
   checkTask()
   renderRuns(d.runs || [])
+
+  // Y-05/06
+  ;(d.input_types || []).forEach(function (it) {
+    var o = document.createElement("option"); o.value = it.id; o.textContent = it.label
+    $("input-type").appendChild(o)
+  })
+  ;(d.datasets || []).forEach(function (f) {
+    var o = document.createElement("option"); o.value = f; o.textContent = f
+    $("dataset").appendChild(o)
+  })
+  syncInputType()
+  // Y-08
+  slots = (d.default_slots || []).map(function (s) { return {element: s.element, rule: s.rule, n: s.n || 3} })
+  renderSlots()
 })
+
+// ---- Y-05/06: where turns come from ----
+function syncInputType() {
+  var chosen = (opts.input_types || []).filter(function (it) { return it.id === $("input-type").value })[0]
+  var needs = chosen && chosen.needs_path
+  $("dataset").disabled = !needs
+  $("dataset").style.opacity = needs ? 1 : .45
+}
+
+// ---- Y-08: life_cycle rows ----
+var slots = []
+
+function renderSlots() {
+  var host = $("lc-rows")
+  host.innerHTML = ""
+  slots.forEach(function (slot, index) {
+    var row = document.createElement("div")
+    row.className = "lc-row"
+    var rule = ruleById(slot.rule)
+    row.innerHTML =
+      '<span class="el">' + slot.element + "</span>" +
+      "<select>" + (opts.lifecycle_rules || []).map(function (r) {
+        return '<option value="' + r.id + '"' + (r.id === slot.rule ? " selected" : "") +
+          ">" + r.label + "</option>"
+      }).join("") + "</select>" +
+      '<input class="n" type="number" min="1" value="' + (slot.n || 3) + '"' +
+        (rule && rule.needs_n ? "" : " hidden") + ">" +
+      '<span class="lc-note">' + (rule ? rule.note : "") + "</span>"
+    var sel = row.querySelector("select")
+    sel.onchange = function () {
+      slots[index].rule = sel.value
+      renderSlots()
+    }
+    var n = row.querySelector(".n")
+    n.oninput = function () { slots[index].n = parseInt(n.value || "1", 10) }
+    // system is fixed; everything else the user added can go away again.
+    if (["user", "think", "assistant"].indexOf(slot.element) === -1) {
+      var del = document.createElement("button")
+      del.type = "button"; del.className = "del"; del.textContent = "删"
+      del.onclick = function () { slots.splice(index, 1); renderSlots() }
+      row.appendChild(del)
+    }
+    host.appendChild(row)
+  })
+}
+
+function ruleById(id) {
+  return (opts.lifecycle_rules || []).filter(function (r) { return r.id === id })[0]
+}
 
 function renderRuns(runs) {
   var host = $("runs")
@@ -613,6 +966,15 @@ function checkTask() {
     : "会新建 task/" + ($("task").value.trim() || "?") + "/"
 }
 $("vendor").onchange = syncVendor
+$("input-type").onchange = syncInputType
+$("lc-add-btn").onclick = function () {
+  var name = $("lc-new").value.trim()
+  if (!name) return
+  if (slots.some(function (s) { return s.element === name })) return
+  slots.push({element: name, rule: "permanent", n: 3})
+  $("lc-new").value = ""
+  renderSlots()
+}
 $("model").onchange = syncModel
 $("task").oninput = checkTask
 $("saved").onchange = function () {
@@ -638,8 +1000,18 @@ $("go").onclick = function () {
       system: $("system").value,
       web_input: $("web-input").checked,
       compact: $("compact").checked,
-      keep_think: $("keep-think").checked,
-      port: $("port").value
+      port: $("port").value,
+      slots: slots,
+      input_type: $("input-type").value,
+      input_path: $("dataset").disabled ? "" : $("dataset").value,
+      compact_interval: $("c-interval").value,
+      compact_keep_recent: $("c-keep").value,
+      compact_threshold: $("c-threshold").value,
+      compact_retention: $("c-retention").value,
+      compact_prompt: $("c-prompt").value,
+      recall: $("recall").checked,
+      recall_trigger: $("r-trigger").value,
+      recall_top_k: $("r-topk").value
     })
   })
     .then(function (r) { return r.json().then(function (d) { if (!r.ok) throw new Error(d.error || r.statusText); return d }) })
@@ -760,8 +1132,21 @@ def _self_test() -> None:
         system="你是测试助手",
         interface="gui",
         port=8999,
-        keep_think=True,
         compact_on=True,
+        slots=[
+            {"element": "user", "rule": "permanent"},
+            {"element": "think", "rule": "born+n", "n": 2},
+            {"element": "assistant", "rule": "until_cancelled"},
+        ],
+        input_type="user_only_json",
+        input_path="task/demo/prompts.json",
+        compact_interval=5,
+        compact_keep_recent=2,
+        compact_threshold=12000,
+        compact_retention="keep_all",
+        recall_on=True,
+        recall_trigger="pattern",
+        recall_top_k=7,
     )
     with tempfile.TemporaryDirectory() as temporary:
         path = Path(temporary) / "runtime.yaml"
@@ -775,18 +1160,38 @@ def _self_test() -> None:
         assert cfg.dataset.kwargs.path == "."
         assert cfg.runtime.viewer.enabled is True
         assert cfg.runtime.viewer.port == 8999
-        assert cfg.life_cycle.to_dict()["think"] == ["born", None]
+        # Y-08: every picked rule reaches the loader in the form it expects.
+        life = cfg.life_cycle.to_dict()
+        assert life["system"] == [1, None]
+        assert life["user"] == ["born", None]          # permanent -> empty end
+        assert life["think"] == ["born", "born+2"]     # parameter kept in the name
+        assert life["assistant"] == ["born", "until_cancelled"]
+        assert life["recall"] == ["born", "born"]      # required once recall is on
+        # Y-05/Y-06
+        assert cfg.input_data.type == "user_only_json"
+        assert cfg.input_data.path == "task/demo/prompts.json"
+        # Y-11~15
+        assert cfg.compact.overload_threshold_bytes == 12000
+        assert cfg.compact.compressors.summary.periodic.interval_turns == 5
+        assert cfg.compact.compressors.summary.periodic.keep_recent_turns == 2
+        assert cfg.compact.compressors.summary.retention == "keep_all"
+        # Y-16~19
+        assert cfg.recall.type == "grep"
+        assert cfg.recall.trigger == "pattern"
+        assert cfg.recall.top_k == 7
+        assert "user" in cfg.recall.search_fields
 
         # compact off is the documented "none", and must still parse.
         off = build_yaml(
             task="panel_off", vendor="ollama", config_name="ollama.json",
-            system="s", interface="input", port=8998, keep_think=False, compact_on=False,
+            system="s", interface="input", port=8998, compact_on=False,
         )
         off_path = Path(temporary) / "off.yaml"
         off_path.write_text(off, encoding="utf-8")
         off_cfg = load_config(off_path)
         assert off_cfg.to_dict()["compact"] == "none"
         assert off_cfg.life_cycle.to_dict()["think"] == ["born", "born"]
+        assert off_cfg.recall.type == "none"
         assert off_cfg.input_data.interface == "input"
 
     # The panel itself serves without any runtime present.

@@ -1590,9 +1590,10 @@ def _model_switch(runtime: "RuntimeComponents") -> Callable[[dict], dict]:
         # _write_provider_to_yaml for why that is not acceptable here.
         config_name = saved_name or str(payload.get("save_as") or "").strip()
         if not config_name:
-            # No name given: derive a stable per-vendor one so there is always
-            # a real file for the YAML to reference.
-            config_name = f"{config.provider}.json"
+            # B-01: name it after this task, not the vendor. A per-vendor file
+            # is shared by every task using that vendor, so switching a model
+            # here would rewrite what another running session is pointing at.
+            config_name = f"{runtime.tables.paths.root.name}.json"
         if not config_name.endswith(".json"):
             config_name += ".json"
         saved_to = str(save_provider_config(config, config_name))
