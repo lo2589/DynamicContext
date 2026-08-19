@@ -34,6 +34,7 @@ from ..provider import ParsedAnswer, build_provider_from_cfg
 from ..recall import recall as recall_registry
 from ..registry import compact, dataset, manager, patch, provider as provider_registry, saver
 from ..saver import table_printer as _table_printer  # Register console printers.
+from ..saver import live_view as _live_view  # Register viewer.serve entry.
 
 
 History = dict[str, dict[str, dict[str, Any]]]
@@ -1351,6 +1352,28 @@ def build_runtime(
     )
 
 
+def _viewer_settings(cfg: Any) -> tuple[bool, int, float, bool]:
+    """Read runtime.viewer: a bare bool, or a mapping with port/interval/open.
+
+    Off by default — a run that never asked to be watched must not bind a
+    port or open a browser tab on its own.
+    """
+
+    runtime_cfg = cfg.to_dict().get("runtime") or {}
+    if not isinstance(runtime_cfg, dict):
+        return False, 8777, 1.0, True
+    raw = runtime_cfg.get("viewer", False)
+    if isinstance(raw, bool):
+        return raw, 8777, 1.0, True
+    if not isinstance(raw, dict):
+        return False, 8777, 1.0, True
+    enabled = bool(raw.get("enabled", True))
+    port = int(raw.get("port") or 8777)
+    interval = float(raw.get("interval") or 1.0)
+    open_browser = bool(raw.get("open", True))
+    return enabled, port, interval, open_browser
+
+
 def _snapshot_every_turns(cfg: Any) -> int:
     runtime_cfg = cfg.to_dict().get("runtime") or {}
     if not isinstance(runtime_cfg, dict):
@@ -1383,6 +1406,33 @@ def run_runtime(runtime: RuntimeComponents) -> None:
 
     show_stream = bool(runtime.cfg.runtime.stream)
     snapshot_every_turns = _snapshot_every_turns(runtime.cfg)
+    viewer_enabled, viewer_port, viewer_interval, viewer_open = _viewer_settings(runtime.cfg)
+    if viewer_enabled:
+        # push_user only feeds a turn loop that is actually reading from that
+        # queue — the terminal interface never looks at it. Handing the page
+        # a live send box when nothing would ever consume what it sends is
+        # worse than not offering one, so it stays read-only until the task
+        # says its turns come from there.
+        interface = (runtime.cfg.to_dict().get("input_data") or {}).get("interface")
+        if interface == "gui":
+            viewer_push = runtime.input_data.push_user
+        else:
+            viewer_push = None
+            print(
+                "[viewer] input_data.interface 不是 gui，网页里的输入框不会生效——"
+                "要用网页发消息，把 input_data.interface 改成 gui"
+            )
+        try:
+            saver["viewer.serve"](
+                runtime.tables.paths.root,
+                label=runtime.cfg.name,
+                port=viewer_port,
+                interval=viewer_interval,
+                open_browser=viewer_open,
+                push=viewer_push,
+            )
+        except Exception as exc:  # noqa: BLE001 - a busy port must never stop a run
+            print(f"[viewer skipped: {exc}]")
     while True:
         try:
             item = runtime.input_data.next()

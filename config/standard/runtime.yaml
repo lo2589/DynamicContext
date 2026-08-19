@@ -20,7 +20,7 @@ answer:
 input_data:
   type: real_user
   path: null
-  interface: input
+  interface: input   # 改成 gui + 打开 runtime.viewer.enabled：改从网页输入框发消息，终端只剩日志
 
 life_cycle:
   system: [1, null]
@@ -74,6 +74,11 @@ runtime:
   stream: true
   print:
     type: tables
+  viewer:
+    enabled: false   # true 时 runtime.run 启动即在后台起 viewer.html 实时服务并开浏览器
+    port: 8777
+    interval: 1.0
+    open: true
   lifecycle: [begin_turn, llm_call, end_turn]
   pipeline:
     begin_turn:
