@@ -49,11 +49,40 @@
 #live-new:hover{background:var(--live);color:var(--paper)}
 #live-new:disabled{opacity:.5;cursor:default}
 
+/* A live run has no use for the file picker or the explainer above it: this
+   page is being used as a workbench, not as a viewer for a recorded ledger
+   someone is about to drop in. They were pushing the conversation below the
+   fold on every load. */
+.drop{display:none}
+.wrap > h1, .wrap > .sub{display:none}
+.wrap > .eyebrow{display:block;margin-bottom:14px}
+
+/* Reasoning is usually the largest thing on the page — a 500-character think
+   next to a one-character answer — so it is collapsed to a couple of lines
+   and opens on click. Kept visible rather than hidden: seeing that the model
+   thought, and how much, is the point of showing it at all. */
+/* flex-shrink:0 is load-bearing. .chat is a column flex container, and a
+   flex item's default min-height:auto is what normally stops it being
+   squashed below its content — but overflow:hidden resets that to 0, so the
+   container crushed this bubble to a 24px sliver showing only its tag.
+   Measured, not guessed: the box was 24px while max-height was 71px. */
+.b.t{max-height:6.2em;flex-shrink:0;overflow:hidden;cursor:pointer;
+  position:relative;padding-bottom:15px}
+.b.t::after{content:"展开";position:absolute;right:9px;bottom:2px;
+  font-size:9px;letter-spacing:.06em;color:var(--live);
+  background:var(--panel);padding:0 4px;border-radius:4px}
+.b.t.open{max-height:none}
+.b.t.open::after{content:"收起"}
+
 /* Per-turn controls, injected into the transcript's turn markers. A turn can
    be taken out of the model's view without touching what it says, or killed
-   outright — two different acts, so two different buttons. */
-.turnmark{position:relative}
-.turn-ops{display:inline-flex;gap:5px;margin-left:9px;vertical-align:middle}
+   outright — two different acts, so two different buttons. The marker becomes
+   a full-width rule so the buttons visibly belong to the turn that follows,
+   instead of floating between two of them. */
+.turnmark{position:relative;align-self:stretch;display:flex;align-items:center;
+  gap:9px;border:0;border-top:1px solid var(--rule);border-radius:0;
+  padding:9px 2px 3px;margin-top:4px;background:transparent}
+.turn-ops{display:inline-flex;gap:5px;margin-left:auto;vertical-align:middle}
 .turn-ops button{padding:1px 7px;border:1px solid var(--rule);border-radius:99px;
   background:transparent;color:var(--ink-2);font:inherit;font-size:9.5px;
   letter-spacing:.04em;cursor:pointer;line-height:1.6}

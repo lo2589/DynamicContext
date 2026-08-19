@@ -315,6 +315,12 @@
   // Token counts change with every commit, so follow the same cadence as the
   // transcript rather than a slow independent timer.
   setInterval(refreshTokens, 2000)
+  // Published deliberately: the per-turn controls live in their own IIFE and
+  // cannot see this scope. Referencing a name across that boundary throws a
+  // ReferenceError at the first click — it is not merely undefined — so
+  // anything shared between the blocks goes on window, the same way
+  // __liveTick does.
+  window.__refreshTokens = refreshTokens
 
   // ---- settings: change the declarations of a running conversation ----
   var settingsBtn = document.getElementById("live-settings")
@@ -582,7 +588,7 @@
         }
         return window.__liveTick()
       })
-      .then(function () { refreshTokens && refreshTokens() })
+      .then(function () { if (window.__refreshTokens) window.__refreshTokens() })
       .catch(function (e) { say(marker, "失败：" + e.message) })
       .then(function () { enable(false) })
   }
@@ -624,4 +630,17 @@
 
   decorate()
   new MutationObserver(decorate).observe(chat, { childList: true })
+})()
+
+// ---- reasoning opens on click ----
+// Delegated on #chat because render() replaces its children wholesale; a
+// listener bound to each bubble would be gone on the next draw.
+;(function () {
+  if (!window.__live.writable) return
+  var chat = document.getElementById("chat")
+  if (!chat) return
+  chat.addEventListener("click", function (event) {
+    var bubble = event.target.closest ? event.target.closest(".b.t") : null
+    if (bubble && chat.contains(bubble)) bubble.classList.toggle("open")
+  })
 })()
