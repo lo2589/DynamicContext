@@ -1,0 +1,23 @@
+<div id="live-send">
+  <div id="live-model">
+    <span>model</span><b id="live-model-now">…</b>
+    <button id="live-model-toggle" type="button">change</button>
+    <div id="live-model-form">
+      <select id="live-model-saved"><option value="">— 新配置 —</option></select>
+      <select id="live-model-vendor"></select>
+      <select id="live-model-name"></select>
+      <input id="live-model-name-manual" placeholder="model 名字" autocomplete="off" hidden>
+      <input id="live-model-url" placeholder="base_url" autocomplete="off">
+      <input id="live-model-key" type="password" placeholder="api_key（本地保存）" autocomplete="off">
+      <input id="live-model-saveas" placeholder="存成 xxx.json（可留空）" autocomplete="off">
+      <button id="live-model-apply" type="button">Apply</button>
+      <span class="status" id="live-model-status"></span>
+    </div>
+  </div>
+  <div class="row">
+    <textarea id="live-send-text" rows="2" placeholder="跟这个 run 说点什么…（回车换行，⌘/Ctrl+回车 或点 Send 发送）"></textarea>
+    <button id="live-send-btn">Send</button>
+    <button id="live-stop" type="button" hidden>停止</button>
+    <span class="status" id="live-send-status"></span>
+  </div>
+</div>

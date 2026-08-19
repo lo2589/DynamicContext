@@ -1639,6 +1639,9 @@ def _settings_read(runtime: "RuntimeComponents") -> Callable[[], dict]:
         compact_cfg = compact_cfg if isinstance(compact_cfg, dict) else {}
         summary = ((compact_cfg.get("compressors") or {}).get("summary") or {})
         periodic = summary.get("periodic") or {}
+        recall_cfg = data.get("recall")
+        recall_cfg = recall_cfg if isinstance(recall_cfg, dict) else {}
+        trigger = recall_cfg.get("trigger")
         return {
             "life_cycle": runtime.tables.life_cycle,
             "elements": sorted(
@@ -1647,6 +1650,12 @@ def _settings_read(runtime: "RuntimeComponents") -> Callable[[], dict]:
             "compact_enabled": bool(compact_cfg),
             "interval_turns": periodic.get("interval_turns"),
             "keep_recent_turns": periodic.get("keep_recent_turns"),
+            "overload_threshold_bytes": compact_cfg.get("overload_threshold_bytes"),
+            "retention": summary.get("retention") or DEFAULT_RETENTION,
+            "compact_prompt": summary.get("prompt") or "",
+            "recall_enabled": str(recall_cfg.get("type") or "none") != "none",
+            "recall_trigger": trigger.get("type") if isinstance(trigger, dict) else (trigger or "always"),
+            "recall_top_k": recall_cfg.get("top_k") or 3,
             "system": (data.get("runtime") or {}).get("system", {}).get("content", ""),
             "yaml_path": str(runtime.cfg.source_path),
         }
@@ -1706,20 +1715,108 @@ def _settings_write(runtime: "RuntimeComponents") -> Callable[[dict], dict]:
             history, state, through_turn=current_turn, roles=runtime.element_roles
         )
 
+        # The system prompt is turn 0's slot, written from config at init. It
+        # is config, so changing it here changes both — otherwise the YAML and
+        # the ledger would disagree about what this conversation was told.
+        system_text = payload.get("system")
+        if isinstance(system_text, str) and system_text.strip():
+            slot = history.get("0", {}).get("system")
+            if slot is not None and slot.get("content") != system_text:
+                slot["content"] = system_text
+                context = runtime.select_context(
+                    history, state, through_turn=current_turn, roles=runtime.element_roles
+                )
+
         saver["life_cycle.save"](runtime.tables, normalized)
         saver["history.save"](runtime.tables, history)
         saver["state.save"](runtime.tables, state)
         saver["context.save"](runtime.tables, context)
         _write_life_cycle_to_yaml(runtime.cfg, normalized)
-        print(f"[life_cycle updated] {normalized}")
+
+        # Everything else is ordinary configuration: write it to the YAML and
+        # reload, so the running session and the file agree and a restart is
+        # identical. _maybe_compress re-reads cfg every turn, so compaction
+        # picks the new numbers up on its own; the recall/retention handles
+        # were resolved once at build time and have to be re-resolved.
+        _write_scalar_settings(runtime.cfg, payload)
+        reloaded = _reconfigure(runtime)
+        print(f"[settings updated] {normalized}")
         return {
             "ok": True,
             "life_cycle": normalized,
             "visible": sum(1 for row in state.values() for value in row.values() if value == 1),
             "context_messages": len(context),
+            "reloaded": reloaded,
         }
 
     return write
+
+
+def _write_scalar_settings(cfg: Any, payload: dict) -> None:
+    """Mirror the non-life_cycle settings into the task YAML, in place."""
+
+    from pathlib import Path
+
+    path = Path(cfg.source_path)
+    text = path.read_text(encoding="utf-8")
+
+    def replace(pattern: str, value: str) -> None:
+        nonlocal text
+        text = re.sub(pattern, value, text, count=1, flags=re.M)
+
+    if isinstance(payload.get("system"), str) and payload["system"].strip():
+        replace(r"^    content: .*$", f"    content: {json.dumps(payload['system'], ensure_ascii=False)}")
+    for key, pattern in (
+        ("interval_turns", r"^        interval_turns: \d+$"),
+        ("keep_recent_turns", r"^        keep_recent_turns: \d+$"),
+    ):
+        if payload.get(key) is not None:
+            replace(pattern, f"        {key}: {int(payload[key])}")
+    if payload.get("overload_threshold_bytes") is not None:
+        replace(
+            r"^  overload_threshold_bytes: \d+$",
+            f"  overload_threshold_bytes: {int(payload['overload_threshold_bytes'])}",
+        )
+    retention = payload.get("retention")
+    if retention:
+        if re.search(r"^      retention: .*$", text, flags=re.M):
+            replace(r"^      retention: .*$", f"      retention: {retention}")
+        else:
+            replace(r"^      periodic:$", f"      retention: {retention}\n      periodic:")
+    if payload.get("recall_trigger"):
+        replace(r"^  trigger: .*$", f"  trigger: {payload['recall_trigger']}")
+    if payload.get("recall_top_k") is not None and re.search(r"^  top_k: \d+$", text, flags=re.M):
+        replace(r"^  top_k: \d+$", f"  top_k: {int(payload['recall_top_k'])}")
+    path.write_text(text, encoding="utf-8")
+
+
+def _reconfigure(runtime: "RuntimeComponents") -> bool:
+    """Re-read the task YAML into the running session.
+
+    Compaction re-reads cfg on every turn, so its numbers need nothing more
+    than the file being correct. Retention and recall were resolved into
+    callables once, at build time, and would otherwise keep answering with the
+    settings this run started with.
+    """
+
+    try:
+        cfg = dataset["config.load"](runtime.cfg.source_path)
+    except Exception as exc:  # noqa: BLE001 - a bad edit must not kill the run
+        print(f"[settings reload skipped: {exc}]")
+        return False
+    runtime.cfg = cfg
+    retention_name, retention_params = _retention_settings(cfg)
+    runtime.retain_summaries = compact[f"retain.{retention_name}"]
+    runtime.retention_params = retention_params
+    trigger_name, trigger_params = _recall_trigger_settings(cfg)
+    runtime.recall_trigger = recall_registry[f"trigger.{trigger_name}"]
+    runtime.recall_trigger_params = trigger_params
+    recall_type = _choice(cfg, "recall", "type", "none")
+    runtime.recall = recall_registry[recall_type]
+    runtime.recall_search_fields = (
+        _recall_search_fields(cfg) if recall_type != "none" else ()
+    )
+    return True
 
 
 def _rederive_ranges(

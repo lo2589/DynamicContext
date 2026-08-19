@@ -21,6 +21,7 @@ it work before any model has been configured.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -386,13 +387,15 @@ def build_yaml(
     text = re.sub(r"^  type: real_user$", f"  type: {input_type}", text, count=1, flags=re.M)
     if input_path:
         # input_data.path is resolved against the YAML's own directory
-        # (_resolved_json_path), and this YAML lives in the task dir — so a
-        # repo-relative path picked in the panel would be looked up under
-        # task/<name>/. Store it absolute; the file is outside this run.
-        resolved = (REPO_ROOT / input_path).resolve()
+        # (_resolved_json_path), and this YAML lives in the task dir — so the
+        # repo-relative path picked in the panel is rewritten relative to that
+        # directory. Never absolute: a YAML carrying a machine's own paths
+        # only runs on that machine, which contradicts this project's claim
+        # that the same input reproduces the same context anywhere.
+        relative = os.path.relpath(REPO_ROOT / input_path, TASKS_DIR / task)
         text = re.sub(
             r"^  path: null$",
-            f"  path: {json.dumps(str(resolved), ensure_ascii=False)}",
+            f"  path: {json.dumps(relative, ensure_ascii=False)}",
             text,
             count=1,
             flags=re.M,
@@ -1204,7 +1207,7 @@ def _self_test() -> None:
             {"element": "assistant", "rule": "until_cancelled"},
         ],
         input_type="user_only_json",
-        input_path="task/demo/prompts.json",
+        input_path="data/sample_prompts.jsonl",
         compact_interval=5,
         compact_keep_recent=2,
         compact_threshold=12000,
@@ -1236,7 +1239,10 @@ def _self_test() -> None:
         assert cfg.input_data.type == "user_only_json"
         # Stored absolute on purpose: relative would resolve against the task
         # directory the YAML lives in, not the repo.
-        assert cfg.input_data.path == str((REPO_ROOT / "task/demo/prompts.json").resolve())
+        # Relative to the YAML's own directory, never absolute: a config
+        # carrying this machine's paths would not run anywhere else.
+        assert cfg.input_data.path == "../../data/sample_prompts.jsonl"
+        assert "/Users/" not in rendered
         # Y-11~15
         assert cfg.compact.overload_threshold_bytes == 12000
         assert cfg.compact.compressors.summary.periodic.interval_turns == 5
