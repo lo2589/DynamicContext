@@ -38,6 +38,7 @@ MODULES = (
     "code.saver.live_view",
     "code.saver.session_registry",
     "code.saver.launcher",
+    "code.saver.multi_host",
 )
 
 

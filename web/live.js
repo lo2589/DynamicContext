@@ -52,7 +52,7 @@
     stopBtn.disabled = true
     // The runtime treats a stop as a successful partial generation, so what
     // was produced up to here is parsed and committed like any other turn.
-    fetch("/interrupt", { method: "POST" })
+    fetch("interrupt", { method: "POST" })
       .then(function (r) { return r.json() })
       .then(function (d) { if (!d.ok) status.textContent = d.reason || "停不了" })
       .catch(function () {})
@@ -118,7 +118,7 @@
     var sent = text  // kept so a failed turn can hand the draft back
     button.disabled = true
     status.textContent = "sending…"
-    fetch("/send", {
+    fetch("send", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text: text }),
@@ -149,7 +149,7 @@
           // Show generation as it arrives — the terminal has always had this
           // via on_chunk; without it a local model looks like a frozen page
           // for the tens of seconds it takes to answer.
-          fetch("/streaming", { cache: "no-store" })
+          fetch("streaming", { cache: "no-store" })
             .then(function (r) { return r.ok ? r.json() : null })
             .then(function (s) {
               if (!s) return
@@ -176,7 +176,7 @@
             // failed outright (bad key, unreachable model). The runtime
             // records why; without checking, a failed turn is indistinguishable
             // from a slow one and the box just spins forever.
-            return fetch("/last-error", { cache: "no-store" })
+            return fetch("last-error", { cache: "no-store" })
               .then(function (r) { return r.ok ? r.json() : null })
               .then(function (d) {
                 if (d && d.error) {
@@ -218,19 +218,24 @@
   var sessionSel = document.getElementById("live-session")
 
   function refreshSessions() {
-    return fetch("/sessions", { cache: "no-store" })
+    return fetch("sessions", { cache: "no-store" })
       .then(function (r) { return r.ok ? r.json() : null })
       .then(function (d) {
         if (!d) return
         if (d.launcher) window.__launcherPort = d.launcher
         if (d.hub) window.__hubPort = d.hub
+        // Hosted: every session lives in one process behind /s/<task>/, so a
+        // switch is a path. Standalone: each is its own process on its own
+        // port, so it is a port. The option value carries whichever applies.
+        window.__hosted = !!d.hosted
         var here = d.here
         var html = ""
         var seen = false
         ;(d.sessions || []).forEach(function (s) {
           var mine = s.task === here
           if (mine) seen = true
-          html += '<option value="' + s.port + '"' + (mine ? " selected" : "") + ">" +
+          var target = d.hosted ? "/s/" + s.task + "/" : s.port
+          html += '<option value="' + target + '"' + (mine ? " selected" : "") + ">" +
             s.task + (mine ? "（这个）" : "") + "</option>"
         })
         if (!seen) html = '<option value="" selected>' + here + "（这个）</option>" + html
@@ -242,7 +247,10 @@
   }
 
   sessionSel.onchange = function () {
-    if (sessionSel.value) location.href = "http://127.0.0.1:" + sessionSel.value + "/"
+    if (!sessionSel.value) return
+    location.href = window.__hosted
+      ? sessionSel.value
+      : "http://127.0.0.1:" + sessionSel.value + "/"
   }
 
   // The stats row already answers "how big is this run" in slots; tokens and
@@ -264,7 +272,7 @@
   }
 
   function refreshTokens() {
-    return fetch("/tokens", { cache: "no-store" })
+    return fetch("tokens", { cache: "no-store" })
       .then(function (r) { return r.ok ? r.json() : null })
       .then(function (d) {
         if (!d) return
@@ -293,7 +301,7 @@
     newBtn.textContent = "开面板…"
     // The panel may not be running; the server starts it if needed and only
     // answers once it is actually listening.
-    fetch("/new-run", { method: "POST" })
+    fetch("new-run", { method: "POST" })
       .then(function (r) { return r.json() })
       .then(function (d) { location.href = d.url })
       .catch(function () { newBtn.disabled = false; newBtn.textContent = "＋ 新对话" })
@@ -380,7 +388,7 @@
   settingsBtn.onclick = function () {
     panel.classList.toggle("open")
     if (!panel.classList.contains("open")) return
-    fetch("/settings", { cache: "no-store" })
+    fetch("settings", { cache: "no-store" })
       .then(function (r) { return r.ok ? r.json() : null })
       .then(function (d) {
         if (!d) return
@@ -393,7 +401,7 @@
   document.getElementById("live-settings-apply").onclick = function () {
     var out = document.getElementById("sc-status")
     out.textContent = "重算中…"
-    fetch("/settings", {
+    fetch("settings", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ life_cycle: declared }),
@@ -430,7 +438,7 @@
   }
 
   function refresh() {
-    return fetch("/models", { cache: "no-store" })
+    return fetch("models", { cache: "no-store" })
       .then(function (r) { return r.ok ? r.json() : null })
       .then(function (data) {
         if (!data) return
@@ -507,7 +515,7 @@
           api_key: keyIn.value,
           save_as: saveAsIn.value.trim(),
         }
-    fetch("/model", {
+    fetch("model", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
