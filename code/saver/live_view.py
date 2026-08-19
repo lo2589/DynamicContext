@@ -83,10 +83,10 @@ SEND_BAR = """
 <style>
 #live-send{display:flex;flex-direction:column;gap:8px;
   padding:10px 14px;border-top:1px solid var(--rule);background:var(--panel)}
-#live-send .row{display:flex;gap:8px;align-items:center}
-#live-send input,#live-send select{padding:7px 9px;border:1px solid var(--rule);
+#live-send .row{display:flex;gap:8px;align-items:flex-end}
+#live-send input,#live-send select,#live-send textarea{padding:7px 9px;border:1px solid var(--rule);
   border-radius:6px;background:var(--paper);color:var(--ink);font:inherit;font-size:12.5px;min-width:0}
-#live-send-text{flex:1}
+#live-send-text{flex:1;resize:vertical;font-family:ui-sans-serif,system-ui,sans-serif;line-height:1.5}
 #live-send button{padding:7px 13px;border:1px solid var(--rule);
   border-radius:6px;background:var(--live);color:var(--paper);cursor:pointer;
   font:inherit;font-size:12.5px;white-space:nowrap}
@@ -119,7 +119,7 @@ SEND_BAR = """
     </div>
   </div>
   <div class="row">
-    <input id="live-send-text" type="text" placeholder="跟这个 run 说点什么…" autocomplete="off">
+    <textarea id="live-send-text" rows="2" placeholder="跟这个 run 说点什么…（回车换行，⌘/Ctrl+回车 或点 Send 发送）"></textarea>
     <button id="live-send-btn">Send</button>
     <span class="status" id="live-send-status"></span>
   </div>
@@ -138,6 +138,7 @@ SEND_BAR = """
   function send() {
     var text = input.value.trim()
     if (!text) return
+    var sent = text  // kept so a failed turn can hand the draft back
     button.disabled = true
     status.textContent = "sending…"
     fetch("/send", {
@@ -165,7 +166,14 @@ SEND_BAR = """
             return fetch("/last-error", { cache: "no-store" })
               .then(function (r) { return r.ok ? r.json() : null })
               .then(function (d) {
-                if (d && d.error) { clearInterval(fast); status.textContent = d.error }
+                if (d && d.error) {
+                  clearInterval(fast)
+                  status.textContent = d.error
+                  // The turn was never committed, so the words are gone
+                  // unless we hand them back. Only restore into an empty box
+                  // — never clobber something typed while waiting.
+                  if (!input.value) input.value = sent
+                }
               })
               .catch(function () {})
           })
@@ -176,8 +184,12 @@ SEND_BAR = """
   }
 
   button.onclick = send
+  // Enter inserts a newline; it must never send. A model can take tens of
+  // seconds, so an accidental Enter looked exactly like "my text vanished" —
+  // the box cleared and nothing came back for a long while. Sending is now
+  // always deliberate: the button, or an explicit modifier+Enter.
   input.addEventListener("keydown", function (e) {
-    if (e.key === "Enter") send()
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send() }
   })
 
   // ---- model picker ----

@@ -1444,6 +1444,64 @@ def _model_status(runtime: "RuntimeComponents") -> Callable[[], dict]:
     return status
 
 
+def _write_provider_to_yaml(cfg: Any, *, vendor: str, config_name: str) -> str:
+    """Point the task YAML's ``provider`` block at the newly chosen model.
+
+    This project's rule (README: "终端输入会先写回实验 yaml……运行期间只有
+    一份生效配置") is that anything which changes configuration lands in the
+    YAML, not only in memory — otherwise the file on disk quietly disagrees
+    with what is running, and a restart silently reverts the change. A model
+    picked in the browser is exactly such a change, so it is written back the
+    same way terminal overrides and ContentPatches already are
+    (_append_terminal_input, patch["yaml.write"]).
+
+    Only the two scalars under ``provider:`` are rewritten, in place —
+    comments, anchors and every other block keep their exact text, which a
+    parse-and-redump would destroy.
+    """
+
+    from pathlib import Path
+
+    path = Path(cfg.source_path)
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    inside = False
+    wrote_type = wrote_config = False
+    for line in lines:
+        stripped = line.strip()
+        if not inside:
+            if re.match(r"^provider\s*:\s*$", line.rstrip("\n")):
+                inside = True
+            out.append(line)
+            continue
+        # The block ends at the first line that is neither indented nor blank.
+        if stripped and not line[:1].isspace():
+            if not wrote_type:
+                out.append(f"  type: {vendor}\n")
+            if not wrote_config:
+                out.append(f"  config: {config_name}\n")
+            inside = False
+            out.append(line)
+            continue
+        if re.match(r"^\s+type\s*:", line):
+            out.append(f"  type: {vendor}\n")
+            wrote_type = True
+            continue
+        if re.match(r"^\s+config\s*:", line):
+            out.append(f"  config: {config_name}\n")
+            wrote_config = True
+            continue
+        out.append(line)
+    if inside:  # provider block ran to end of file
+        if not wrote_type:
+            out.append(f"  type: {vendor}\n")
+        if not wrote_config:
+            out.append(f"  config: {config_name}\n")
+    path.write_text("".join(out), encoding="utf-8")
+    return str(path)
+
+
 def _installed_ollama_models(base_url: str) -> list[str]:
     """Ask a local Ollama what it has pulled. Best-effort: an unreachable or
     slow daemon yields an empty list rather than blocking the page."""
@@ -1522,17 +1580,30 @@ def _model_switch(runtime: "RuntimeComponents") -> Callable[[dict], dict]:
         instance = build_provider(config)
         runtime.provider = instance
 
-        saved_to = None
-        save_as = str(payload.get("save_as") or "").strip()
-        if save_as:
-            saved_to = str(save_provider_config(config, save_as))
-        print(f"[model switched: {config.provider} / {config.model}]")
+        # Persist, then point the YAML at what was persisted. A switch that
+        # only lived in memory would make the running session disagree with
+        # its own config file and revert on restart — see
+        # _write_provider_to_yaml for why that is not acceptable here.
+        config_name = saved_name or str(payload.get("save_as") or "").strip()
+        if not config_name:
+            # No name given: derive a stable per-vendor one so there is always
+            # a real file for the YAML to reference.
+            config_name = f"{config.provider}.json"
+        if not config_name.endswith(".json"):
+            config_name += ".json"
+        saved_to = str(save_provider_config(config, config_name))
+        yaml_path = _write_provider_to_yaml(
+            runtime.cfg, vendor=config.provider, config_name=config_name
+        )
+        print(f"[model switched: {config.provider} / {config.model} → {config_name}]")
         return {
             "ok": True,
             "provider": config.provider,
             "model": config.model,
             "base_url": config.base_url,
             "saved_to": saved_to,
+            "config_name": config_name,
+            "yaml": yaml_path,
         }
 
     return switch
