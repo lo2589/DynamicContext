@@ -45,6 +45,9 @@ from ..registry import saver
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SESSIONS_FILE = REPO_ROOT / "task" / ".sessions.json"
 HUB_PORT = 8776
+# Where "start a new run" lives, so a session page can offer it without
+# importing the launcher (which would pull the whole panel into every run).
+LAUNCHER_HINT = 8775
 
 
 @contextlib.contextmanager

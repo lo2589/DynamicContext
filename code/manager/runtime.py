@@ -1710,7 +1710,11 @@ def run_runtime(runtime: RuntimeComponents) -> None:
         try:
             saver["viewer.serve"](
                 runtime.tables.paths.root,
-                label=runtime.cfg.name,
+                # The directory, not cfg.name: two tasks copied from the
+                # same template share a `name:` field, and the registry then
+                # lists both under it. The directory is what actually
+                # distinguishes one run's ledger from another's.
+                label=runtime.tables.paths.root.name,
                 port=viewer_port,
                 interval=viewer_interval,
                 open_browser=viewer_open,
@@ -1733,10 +1737,10 @@ def run_runtime(runtime: RuntimeComponents) -> None:
             # must not stop a run that can already serve its own viewer fine.
             try:
                 session_id = saver["session.register"](
-                    task=runtime.cfg.name,
+                    task=runtime.tables.paths.root.name,
                     task_dir=runtime.tables.paths.root,
                     port=viewer_port,
-                    label=runtime.cfg.name,
+                    label=runtime.tables.paths.root.name,
                 )
                 saver["hub.serve"]()
             except Exception as exc:  # noqa: BLE001

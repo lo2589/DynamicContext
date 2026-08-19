@@ -36,6 +36,16 @@ from ..registry import saver
 REPO_ROOT = Path(__file__).resolve().parents[2]
 VIEWER = REPO_ROOT / "viewer.html"
 
+# Last context seen per task, and the prefix-reuse figure derived from it.
+# Providers cache a prompt by its leading messages, so what matters is how
+# much of this turn's context is byte-identical to last turn's *from the
+# front* — one edit to an early message invalidates everything after it. That
+# is exactly what this runtime does when a life_cycle retires an old slot or
+# a compaction replaces a stretch of turns, so the number puts a price on
+# those decisions. Kept in memory: it is a property of the transition between
+# two turns, not of any file, and a fresh process has not seen a transition.
+_CACHE_STATE: dict[str, dict] = {}
+
 # Injected at the end of the page. The viewer defines `load(jsonl, label)` and
 # calls it for every dataset button, so following a live file needs no new
 # rendering path — just that function, called again when the bytes change.
@@ -107,6 +117,17 @@ SEND_BAR = """
 #live-model-form.open{display:flex}
 #live-model-form input{flex:1;min-width:9rem;font-size:11.5px;padding:5px 8px}
 #live-model-form select{font-size:11.5px;padding:5px 8px}
+/* Session controls and the token readout live in the Conversation pane's own
+   heading: that row already says what this pane is showing, and switching
+   runs or starting one is the same kind of statement about it. */
+#live-head{display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+  letter-spacing:0;text-transform:none;font-size:11.5px;color:var(--ink-2)}
+#live-session{font-size:11.5px;padding:3px 7px;max-width:13rem;border:1px solid var(--rule);
+  border-radius:6px;background:var(--paper);color:var(--ink);font-family:inherit}
+#live-new{padding:3px 9px;border:1px solid var(--live);border-radius:6px;
+  background:transparent;color:var(--live);font:inherit;font-size:11px;cursor:pointer}
+#live-new:hover{background:var(--live);color:var(--paper)}
+#live-new:disabled{opacity:.5;cursor:default}
 </style>
 <div id="live-send">
   <div id="live-model">
@@ -151,9 +172,16 @@ SEND_BAR = """
   // The stream carries the model's raw markup (<think>…</think> then the
   // answer). Split it the same way the ledger will, so what is shown while
   // generating matches what is shown once committed.
+  // The question being answered has not been committed yet, so it is not in
+  // #chat — without echoing it here the reply's bubbles appear above the
+  // message that prompted them, which reads as the model answering before
+  // being asked. pendingUser is cleared together with the bubbles, at the
+  // moment the committed turn (which contains the real user slot) lands.
+  var pendingUser = ""
+
   function renderLive(text) {
-    if (!text) { live.innerHTML = ""; return }
-    var think = "", answer = text
+    if (!text && !pendingUser) { live.innerHTML = ""; return }
+    var think = "", answer = text || ""
     var open = text.indexOf("<think>")
     if (open !== -1) {
       var close = text.indexOf("</think>")
@@ -161,6 +189,9 @@ SEND_BAR = """
       else { think = text.slice(open + 7, close); answer = text.slice(close + 8) }
     }
     var html = ""
+    if (pendingUser) {
+      html += '<div class="b u">' + escapeHtml(pendingUser) + "</div>"
+    }
     if (think.trim()) {
       html += '<div class="b t"><span class="tag">think · generating</span>' +
         escapeHtml(think.trim().slice(-400)) + "</div>"
@@ -191,6 +222,8 @@ SEND_BAR = """
       .then(function (r) { return r.ok ? r.json() : r.json().then(function (e) { throw new Error(e.error || r.statusText) }) })
       .then(function () {
         input.value = ""
+        pendingUser = sent
+        renderLive("")
         status.textContent = "waiting for reply…"
         // The turn only lands once the model finishes; poll a bit faster
         // than the configured interval right after sending so it shows up
@@ -201,6 +234,7 @@ SEND_BAR = """
         function finish(message) {
           clearInterval(fast)
           status.textContent = message || ""
+          pendingUser = ""
           renderLive("")
           window.__liveTick()  // make sure the committed turn is on screen
         }
@@ -262,6 +296,109 @@ SEND_BAR = """
   input.addEventListener("keydown", function (e) {
     if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send() }
   })
+
+  // ---- session switcher (top of page) ----
+  var head = document.createElement("span")
+  head.id = "live-head"
+  head.innerHTML = '<select id="live-session"></select>' +
+    '<button id="live-new" type="button">＋ 新对话</button>'
+  // The Conversation pane's heading — the row that already reads
+  // "Conversation · N slots · M exchanges".
+  var h2 = chat && chat.parentNode ? chat.parentNode.querySelector("h2") : null
+  if (h2) h2.appendChild(head)
+
+  var sessionSel = document.getElementById("live-session")
+
+  function refreshSessions() {
+    return fetch("/sessions", { cache: "no-store" })
+      .then(function (r) { return r.ok ? r.json() : null })
+      .then(function (d) {
+        if (!d) return
+        if (d.launcher) window.__launcherPort = d.launcher
+        if (d.hub) window.__hubPort = d.hub
+        var here = d.here
+        var html = ""
+        var seen = false
+        ;(d.sessions || []).forEach(function (s) {
+          var mine = s.task === here
+          if (mine) seen = true
+          html += '<option value="' + s.port + '"' + (mine ? " selected" : "") + ">" +
+            s.task + (mine ? "（这个）" : "") + "</option>"
+        })
+        if (!seen) html = '<option value="" selected>' + here + "（这个）</option>" + html
+        // No "new run" entry here: the button beside this select already does
+        // it, and offering the same action twice in one row is just noise.
+        sessionSel.innerHTML = html
+      })
+      .catch(function () {})
+  }
+
+  sessionSel.onchange = function () {
+    if (sessionSel.value) location.href = "http://127.0.0.1:" + sessionSel.value + "/"
+  }
+
+  // The stats row already answers "how big is this run" in slots; tokens and
+  // prefix reuse answer the same question in the unit a provider bills and
+  // caches by, so they belong in that row rather than squeezed into a
+  // heading. Built with the page's own markup so they inherit its styling.
+  var statsRow = document.querySelector(".stats")
+  var tokensOut = null
+  if (statsRow) {
+    var extra = document.createElement("span")
+    extra.id = "live-token-stats"
+    extra.style.display = "contents"
+    extra.innerHTML =
+      '<span>history tokens<b id="lt-history">0</b></span>' +
+      '<span>context tokens<b id="lt-context">0</b></span>' +
+      '<span>prefix cache<b id="lt-cache">—</b></span>'
+    statsRow.appendChild(extra)
+    tokensOut = extra
+  }
+
+  function refreshTokens() {
+    return fetch("/tokens", { cache: "no-store" })
+      .then(function (r) { return r.ok ? r.json() : null })
+      .then(function (d) {
+        if (!d) return
+        var hit = (d.cache_hit === null || d.cache_hit === undefined) ? "—" : d.cache_hit + "%"
+        document.getElementById("lt-history").textContent = fmt(d.history_tokens)
+        document.getElementById("lt-context").textContent = fmt(d.context_tokens)
+        document.getElementById("lt-cache").textContent = hit
+        tokensOut.title =
+          "history " + d.history_chars + " 字符 / 约 " + d.history_tokens + " token（账本里写下的全部内容）\\n" +
+          "context " + d.context_chars + " 字符 / 约 " + d.context_tokens + " token（本轮真正送给模型的）\\n" +
+          d.context_messages + " 条消息\\n" +
+          "cache：本轮 context 与上一轮相同的前缀占比（" + (d.cache_reused_tokens || 0) +
+          " token 可复用）。退役一条靠前的槽位会让前缀失配，命中率掉下来。\\n" +
+          "token 为估算，非精确分词"
+      })
+      .catch(function () {})
+  }
+
+  function fmt(n) {
+    return n >= 1000 ? (n / 1000).toFixed(1) + "k" : String(n)
+  }
+
+  var newBtn = document.getElementById("live-new")
+  newBtn.onclick = function () {
+    newBtn.disabled = true
+    newBtn.textContent = "开面板…"
+    // The panel may not be running; the server starts it if needed and only
+    // answers once it is actually listening.
+    fetch("/new-run", { method: "POST" })
+      .then(function (r) { return r.json() })
+      .then(function (d) { location.href = d.url })
+      .catch(function () { newBtn.disabled = false; newBtn.textContent = "＋ 新对话" })
+  }
+
+  refreshTokens()
+  refreshSessions()
+  // Sessions come and go while this page is open; a stale list would send
+  // the user to a dead port.
+  setInterval(refreshSessions, 5000)
+  // Token counts change with every commit, so follow the same cadence as the
+  // transcript rather than a slow independent timer.
+  setInterval(refreshTokens, 2000)
 
   // ---- model picker ----
   var now = document.getElementById("live-model-now")
@@ -504,6 +641,21 @@ class Handler(BaseHTTPRequestHandler):
             # and a 503 there would read as "the send failed" rather than
             # "this page has no runtime to report errors from".
             self._send_json({"error": self.last_error() if self.last_error else None})
+        elif path == "/tokens":
+            self._send_json(self._token_stats())
+        elif path == "/sessions":
+            # The registry is shared state on disk, so a session can list its
+            # siblings without any of them knowing about each other. Serving
+            # it here (not only from the hub) is what lets the page offer a
+            # switcher instead of making the user remember port numbers.
+            from .session_registry import HUB_PORT, LAUNCHER_HINT, list_sessions
+
+            self._send_json({
+                "sessions": list(list_sessions().values()),
+                "here": str(self.task_dir.name),
+                "launcher": LAUNCHER_HINT,
+                "hub": HUB_PORT,
+            })
         elif path == "/streaming":
             # Partial output for the turn in flight. Always 200 for the same
             # reason /last-error is: the page polls this constantly, and a
@@ -556,6 +708,82 @@ class Handler(BaseHTTPRequestHandler):
             return f"/{element} {content} {mode} {turns}"
         raise KeyError(path)
 
+    def _token_stats(self) -> dict:
+        """How much text the ledger holds vs. how much is actually being sent.
+
+        The gap between the two is the entire point of this runtime: history
+        grows forever while context is a projection of it, so seeing both
+        numbers side by side is what makes a life_cycle or a compaction
+        legible. Counted from the same files the viewer already reads, so
+        this works for a finished run as well as a live one.
+
+        Tokens are estimated, not tokenized: every provider here uses a
+        different tokenizer, and pulling one in to put a number on a status
+        line would be a heavy dependency for a figure nobody bills against.
+        CJK runs about a token per character, other text about four
+        characters per token.
+        """
+
+        def estimate(text: str) -> int:
+            cjk = sum(1 for ch in text if "\u3400" <= ch <= "\u9fff" or "\uf900" <= ch <= "\ufaff")
+            return cjk + max(0, (len(text) - cjk)) // 4
+
+        history_chars = history_tokens = 0
+        history_path = self.task_dir / "history.jsonl"
+        if history_path.is_file():
+            for line in history_path.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                for slot in (row.get("content") or {}).values():
+                    text = str((slot or {}).get("content") or "")
+                    history_chars += len(text)
+                    history_tokens += estimate(text)
+
+        context_chars = context_tokens = context_messages = 0
+        messages: list = []
+        context_path = self.task_dir / "context_latest.json"
+        if context_path.is_file():
+            try:
+                loaded = json.loads(context_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                loaded = []
+            messages = loaded if isinstance(loaded, list) else []
+            context_messages = len(messages)
+            for message in messages:
+                text = str((message or {}).get("content") or "")
+                context_chars += len(text)
+                context_tokens += estimate(text)
+
+        state = _CACHE_STATE.setdefault(str(self.task_dir), {})
+        previous = state.get("messages")
+        if previous is not None and messages != previous:
+            shared = 0
+            for old, new in zip(previous, messages):
+                if old != new:
+                    break
+                shared += estimate(str((new or {}).get("content") or ""))
+            state["reused_tokens"] = shared
+            state["total_tokens"] = context_tokens
+            state["hit"] = round(100 * shared / context_tokens, 1) if context_tokens else 0.0
+        if previous is None or messages != previous:
+            state["messages"] = messages
+
+        return {
+            "history_chars": history_chars,
+            "history_tokens": history_tokens,
+            "context_chars": context_chars,
+            "context_tokens": context_tokens,
+            "context_messages": context_messages,
+            # None until two different contexts have been observed — there is
+            # no reuse figure for a turn with nothing to compare against.
+            "cache_hit": state.get("hit"),
+            "cache_reused_tokens": state.get("reused_tokens"),
+        }
+
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0]
         if path == "/recall/preview":
@@ -563,6 +791,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/model":
             self._handle_model_switch()
+            return
+        if path == "/new-run":
+            from .launcher import ensure_launcher
+
+            self._send_json({"url": ensure_launcher()})
             return
         if path not in self.CONTROL_PATHS:
             self.send_error(404)
@@ -717,6 +950,45 @@ def start_viewer(
     return server
 
 
+def _script_blocks(html: str) -> list[str]:
+    return re.findall(r"<script>(.*?)</script>", html, re.S)
+
+
+def _assert_js_parses(html: str) -> None:
+    """Every injected <script> must at least be lexically intact.
+
+    This page's whole interactive layer — composer, session switcher, model
+    picker, streaming — lives in one injected script, so a single broken
+    string literal takes all of it out at once and the page silently
+    degrades to the read-only viewer. That is indistinguishable from "the
+    feature was reverted", and it has happened: a `\n` written into the
+    Python template became a real newline in the served JS, leaving an
+    unterminated string.
+
+    Node is used when present (a real parse); otherwise fall back to
+    checking that no string literal spans a line break, which is exactly the
+    failure mode the template makes easy.
+    """
+
+    import shutil
+    import subprocess as _subprocess
+
+    for index, block in enumerate(_script_blocks(html)):
+        node = shutil.which("node")
+        if node:
+            result = _subprocess.run(
+                [node, "--check", "-"], input=block, capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                raise AssertionError(f"script[{index}] 不是合法 JS：{result.stderr.strip()[:200]}")
+            continue
+        for number, line in enumerate(block.splitlines(), 1):
+            stripped = re.sub(r"\\.", "", line)
+            stripped = re.sub(r"//.*", "", stripped)
+            if stripped.count('"') % 2:
+                raise AssertionError(f"script[{index}] L{number} 双引号未闭合：{line.strip()[:80]}")
+
+
 def _self_test() -> None:
     import tempfile
     import urllib.request
@@ -749,6 +1021,7 @@ def _self_test() -> None:
             assert b"const SAMPLES = {\"v4" in body
             assert b"selftest" in body
             assert b"live-send" not in body
+            _assert_js_parses(body.decode("utf-8"))
             with opener.open(f"http://127.0.0.1:{port}/history.jsonl") as response:
                 data = response.read()
             assert data == b'{"id":0}\n'
@@ -854,6 +1127,9 @@ def _self_test() -> None:
                 body = response.read()
             assert b"const SAMPLES = {};" in body
             assert b"live-send" in body
+            # The interactive layer is one script; if it does not parse the
+            # page silently loses every feature at once.
+            _assert_js_parses(body.decode("utf-8"))
             def post(sub_path: str, body: dict) -> tuple[int, dict]:
                 request = urllib.request.Request(
                     f"http://127.0.0.1:{port}{sub_path}",
