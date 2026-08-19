@@ -63,12 +63,23 @@ def _require_turn(runtime: Any, turn: int) -> dict:
 
 
 def hide_turn(runtime: Any, turn: int, element: str | None = None) -> dict:
-    """Close the interval from the next turn on.
+    """Take the whole turn out of view, starting now.
 
-    ``turn + 1``, not ``turn``: the records genuinely were in view for the
-    turn they belong to, and the model did answer with them present. Ending
-    them at their own turn would rewrite that, which is the one thing the
-    interval is supposed to be honest about.
+    ``end_cell(turn=X)`` means "not visible from turn X on", recording X-1 as
+    the last turn it was shown. Passing the *current* turn is what makes the
+    change immediate: the projection is computed at the current turn, so the
+    slots drop out of state and context the moment this returns.
+
+    Passing ``turn + 1`` instead — which reads as the more conservative
+    choice, since those records genuinely were present when their own turn
+    was answered — is off by one for the case that matters most. Hiding the
+    newest turn is what you do right after a bad answer, and there ``turn+1``
+    is one past the current turn, so the interval closes in the future and
+    nothing changes on screen until another turn is taken.
+
+    For the newest turn this leaves an interval that ends before it starts.
+    That is the truthful reading: the answer never carried forward into
+    anything, and the words themselves are still on the record.
     """
 
     current_turn = max((int(key) for key in runtime.tables.history), default=0)
@@ -81,7 +92,7 @@ def hide_turn(runtime: Any, turn: int, element: str | None = None) -> dict:
     for name in _targets(content, element):
         if runtime.tables.state.get(str(turn), {}).get(name) != 1:
             continue  # already out of view
-        lifecycle.end_cell(name, turn, turn=max(turn + 1, current_turn))
+        lifecycle.end_cell(name, turn, turn=current_turn)
         hidden.append(name)
     result = _project_and_save(runtime, history, current_turn)
     print(f"[turn {turn} hidden] {hidden or '(已经不可见)'}")
@@ -158,7 +169,7 @@ def delete_turn(runtime: Any, turn: int, element: str | None = None) -> dict:
         if slot is None or slot.get(DEAD_KEY) is not None:
             continue
         if runtime.tables.state.get(str(turn), {}).get(name) == 1:
-            lifecycle.end_cell(name, turn, turn=max(turn + 1, current_turn))
+            lifecycle.end_cell(name, turn, turn=current_turn)
         # Recorded on the slot, not in a side table: whoever reads this
         # ledger later sees the death next to the thing that died.
         slot[DEAD_KEY] = current_turn
@@ -214,6 +225,19 @@ def _self_test() -> None:
 
         assert runtime.tables.state["2"]["user"] == 1
         assert runtime.tables.state["2"]["assistant"] == 1
+
+        # The case that matters most: hiding the turn that just landed, right
+        # after a bad answer. This has to take effect now, not one turn later
+        # — closing the interval at turn+1 left it visible until something
+        # else was said, so the screen did not change when the button was
+        # clicked.
+        newest = hide_turn(runtime, 3)
+        assert set(newest["hidden"]) == {"user", "think", "assistant"}
+        assert runtime.tables.state["3"] == {"user": 0, "think": 0, "assistant": 0}
+        assert all(
+            message.get("content") != "third" for message in runtime.tables.context
+        )
+        show_turn(runtime, 3)
 
         # Hiding leaves the words alone and only closes the interval.
         before = runtime.tables.history["2"]["assistant"]["content"]
