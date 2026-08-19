@@ -30,6 +30,7 @@ from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from ..dataset.input_data import MANUAL_COMPRESS_COMMAND
 from ..registry import saver
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -154,11 +155,15 @@ class Handler(BaseHTTPRequestHandler):
         task_dir: Path,
         body: bytes,
         push: Callable[[str], None] | None,
+        recall_preview: Callable[[str], list[str]] | None = None,
+        compress_status: Callable[[], dict] | None = None,
         **kwargs,
     ) -> None:
         self.task_dir = task_dir
         self.body = body
         self.push = push
+        self.recall_preview = recall_preview
+        self.compress_status = compress_status
         super().__init__(*args, **kwargs)
 
     def _send(self, payload: bytes, mime: str, *, status: int = 200) -> None:
@@ -172,6 +177,19 @@ class Handler(BaseHTTPRequestHandler):
     def _send_json(self, payload: dict, *, status: int = 200) -> None:
         self._send(json.dumps(payload).encode("utf-8"), "application/json", status=status)
 
+    # URL path -> on-disk filename, for every fixed table besides history.jsonl
+    # (which keeps its own branch below since it predates this map). Same
+    # convention as history.jsonl: the default DEFAULT_TABLE_NAMES filename,
+    # not whatever a task's YAML renamed it to — a task that renamed a table
+    # would need this map extended, exactly as it would for history.jsonl.
+    TABLE_FILES = {
+        "/state.json": "state_latest.json",
+        "/context.json": "context_latest.json",
+        "/life_cycle.json": "life_cycle.json",
+        "/patches.jsonl": "patches.jsonl",
+        "/raw.jsonl": "raw_history.jsonl",
+    }
+
     def do_GET(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler's spelling
         path = self.path.split("?", 1)[0]
         if path in ("/", "/index.html"):
@@ -182,11 +200,78 @@ class Handler(BaseHTTPRequestHandler):
             # polling and picks it up when the first turn commits.
             data = history.read_bytes() if history.is_file() else b""
             self._send(data, "application/x-ndjson; charset=utf-8")
+        elif path in self.TABLE_FILES:
+            table = self.task_dir / self.TABLE_FILES[path]
+            mime = "application/json" if path.endswith(".json") else "application/x-ndjson; charset=utf-8"
+            default = b"{}" if path.endswith(".json") else b""
+            data = table.read_bytes() if table.is_file() else default
+            self._send(data, mime)
+        elif path == "/snapshots":
+            snapshots_dir = self.task_dir / "snapshots"
+            names = (
+                sorted(p.name for p in snapshots_dir.iterdir() if p.is_dir())
+                if snapshots_dir.is_dir()
+                else []
+            )
+            self._send_json({"snapshots": names})
+        elif path == "/compress/status":
+            # IF-15: needs a live runtime (compression settings + in-memory
+            # history/state), not just files on disk — None outside runtime.viewer.
+            if self.compress_status is None:
+                self._send_json({"error": "此页面没有接到可写入的 runtime"}, status=503)
+                return
+            self._send_json(self.compress_status())
         else:
             self.send_error(404)
 
+    # C 区 (IF-10~13): each just builds the same text a terminal user would
+    # type and hands it to push — DatasetInputProcessor.next() already knows
+    # how to parse /compat, /pin, /cancelpin, and the ContentPatch grammar
+    # (code/dataset/input_data.py). No new runtime behavior, only validation
+    # that turns a malformed request into a 400 instead of a silently
+    # swallowed bad command.
+    CONTROL_PATHS = frozenset({"/send", "/compress", "/pin", "/cancelpin", "/patch"})
+
+    def _build_command(self, path: str, payload: dict) -> str:
+        if path == "/send":
+            text = str(payload.get("text") or "").strip()
+            if not text:
+                raise ValueError("empty text")
+            return text
+        if path == "/compress":
+            return MANUAL_COMPRESS_COMMAND
+        if path == "/pin":
+            content = str(payload.get("content") or "").strip()
+            if not content:
+                raise ValueError("empty content")
+            return f"/pin {content}"
+        if path == "/cancelpin":
+            pin_id = str(payload.get("pin_id") or "").strip()
+            if not pin_id:
+                raise ValueError("empty pin_id")
+            return f"/cancelpin {pin_id}"
+        if path == "/patch":
+            element = str(payload.get("element") or "").strip()
+            content = str(payload.get("content") or "").strip()
+            mode = str(payload.get("mode") or "").strip()
+            turns = payload.get("turns")
+            if not element or "/" in element or " " in element:
+                raise ValueError("element must be a single bare name")
+            if not content:
+                raise ValueError("empty content")
+            if mode not in ("remain", "roll"):
+                raise ValueError("mode must be 'remain' or 'roll'")
+            if isinstance(turns, bool) or not isinstance(turns, int) or turns < 1:
+                raise ValueError("turns must be a positive integer")
+            return f"/{element} {content} {mode} {turns}"
+        raise KeyError(path)
+
     def do_POST(self) -> None:  # noqa: N802
-        if self.path.split("?", 1)[0] != "/send":
+        path = self.path.split("?", 1)[0]
+        if path == "/recall/preview":
+            self._handle_recall_preview()
+            return
+        if path not in self.CONTROL_PATHS:
             self.send_error(404)
             return
         if self.push is None:
@@ -198,12 +283,13 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         try:
             payload = json.loads(self.rfile.read(length) or b"{}")
-            text = str(payload.get("text") or "").strip()
         except (json.JSONDecodeError, UnicodeDecodeError):
             self._send_json({"error": "invalid JSON body"}, status=400)
             return
-        if not text:
-            self._send_json({"error": "empty text"}, status=400)
+        try:
+            text = self._build_command(path, payload)
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
             return
         try:
             self.push(text)
@@ -211,6 +297,26 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": str(exc)}, status=500)
             return
         self._send_json({"ok": True})
+
+    def _handle_recall_preview(self) -> None:
+        # IF-14: runs recall["grep"] directly against an ad-hoc query, not
+        # tied to the trigger that normally decides whether recall fires on a
+        # real turn — needs the live runtime for the same reason
+        # compress_status does, so None outside runtime.viewer.
+        if self.recall_preview is None:
+            self._send_json({"error": "此页面没有接到可写入的 runtime"}, status=503)
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            payload = json.loads(self.rfile.read(length) or b"{}")
+            query = str(payload.get("query") or "").strip()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._send_json({"error": "invalid JSON body"}, status=400)
+            return
+        if not query:
+            self._send_json({"error": "empty query"}, status=400)
+            return
+        self._send_json({"results": self.recall_preview(query)})
 
     def log_message(self, *_args) -> None:
         """Silence per-request logging; the poll would drown the console."""
@@ -224,6 +330,8 @@ def build_server(
     interval_ms: int,
     bare: bool = False,
     push: Callable[[str], None] | None = None,
+    recall_preview: Callable[[str], list[str]] | None = None,
+    compress_status: Callable[[], dict] | None = None,
 ) -> ThreadingHTTPServer:
     if not VIEWER.is_file():
         raise SystemExit(f"{VIEWER} 不存在")
@@ -233,6 +341,8 @@ def build_server(
         task_dir=task_dir,
         body=page(label, interval_ms, bare=bare, writable=push is not None),
         push=push,
+        recall_preview=recall_preview,
+        compress_status=compress_status,
     )
     return ThreadingHTTPServer(("127.0.0.1", port), handler)
 
@@ -247,6 +357,8 @@ def start_viewer(
     open_browser: bool = True,
     push: Callable[[str], None] | None = None,
     bare: bool = True,
+    recall_preview: Callable[[str], list[str]] | None = None,
+    compress_status: Callable[[], dict] | None = None,
 ) -> ThreadingHTTPServer:
     """Serve the live viewer for ``task_dir`` in a background thread.
 
@@ -255,7 +367,14 @@ def start_viewer(
     never bounds the run's own turn loop.
     """
     server = build_server(
-        task_dir, label=label, port=port, interval_ms=int(interval * 1000), bare=bare, push=push
+        task_dir,
+        label=label,
+        port=port,
+        interval_ms=int(interval * 1000),
+        bare=bare,
+        push=push,
+        recall_preview=recall_preview,
+        compress_status=compress_status,
     )
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{port}/"
@@ -279,6 +398,15 @@ def _self_test() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         task_dir = Path(temporary)
         (task_dir / "history.jsonl").write_text('{"id":0}\n', encoding="utf-8")
+        (task_dir / "state_latest.json").write_text('{"0":{"system":1}}', encoding="utf-8")
+        (task_dir / "context_latest.json").write_text(
+            '[{"role":"system","content":"hi"}]', encoding="utf-8"
+        )
+        (task_dir / "life_cycle.json").write_text('{"system":[1,null]}', encoding="utf-8")
+        (task_dir / "patches.jsonl").write_text('{"turn":1,"element":"goal"}\n', encoding="utf-8")
+        (task_dir / "raw_history.jsonl").write_text('{"id":1,"raw":"<think>1</think>"}\n', encoding="utf-8")
+        (task_dir / "snapshots" / "turn_0002").mkdir(parents=True)
+        (task_dir / "snapshots" / "turn_0001").mkdir(parents=True)
 
         # Read-only mode (serve.py's use): no send bar, shipped samples kept.
         server = build_server(task_dir, label="selftest", port=0, interval_ms=500)
@@ -294,6 +422,40 @@ def _self_test() -> None:
             with opener.open(f"http://127.0.0.1:{port}/history.jsonl") as response:
                 data = response.read()
             assert data == b'{"id":0}\n'
+
+            # R 区: IF-04~09, plain reads of the other fixed tables.
+            with opener.open(f"http://127.0.0.1:{port}/state.json") as response:
+                assert json.loads(response.read()) == {"0": {"system": 1}}
+            with opener.open(f"http://127.0.0.1:{port}/context.json") as response:
+                assert json.loads(response.read()) == [{"role": "system", "content": "hi"}]
+            with opener.open(f"http://127.0.0.1:{port}/life_cycle.json") as response:
+                assert json.loads(response.read()) == {"system": [1, None]}
+            with opener.open(f"http://127.0.0.1:{port}/patches.jsonl") as response:
+                assert response.read() == b'{"turn":1,"element":"goal"}\n'
+            with opener.open(f"http://127.0.0.1:{port}/raw.jsonl") as response:
+                assert response.read() == b'{"id":1,"raw":"<think>1</think>"}\n'
+            with opener.open(f"http://127.0.0.1:{port}/snapshots") as response:
+                assert json.loads(response.read()) == {"snapshots": ["turn_0001", "turn_0002"]}
+
+            # A table that hasn't been written yet is a default value, not a 404.
+            with tempfile.TemporaryDirectory() as empty_temporary:
+                empty_dir = Path(empty_temporary)
+                empty_server = build_server(empty_dir, label="empty", port=0, interval_ms=500)
+                empty_thread = threading.Thread(target=empty_server.serve_forever, daemon=True)
+                empty_thread.start()
+                try:
+                    empty_port = empty_server.server_address[1]
+                    with opener.open(f"http://127.0.0.1:{empty_port}/state.json") as response:
+                        assert json.loads(response.read()) == {}
+                    with opener.open(f"http://127.0.0.1:{empty_port}/patches.jsonl") as response:
+                        assert response.read() == b""
+                    with opener.open(f"http://127.0.0.1:{empty_port}/snapshots") as response:
+                        assert json.loads(response.read()) == {"snapshots": []}
+                finally:
+                    empty_server.shutdown()
+                    empty_server.server_close()
+                    empty_thread.join(timeout=2)
+
             request = urllib.request.Request(
                 f"http://127.0.0.1:{port}/send",
                 data=b'{"text":"hi"}',
@@ -305,6 +467,24 @@ def _self_test() -> None:
                 raise AssertionError("push 未接入时 /send 应该失败")
             except urllib.error.HTTPError as exc:
                 assert exc.code == 503
+
+            # N 区 (IF-14/15): unwired outside runtime.viewer -> 503, not a crash.
+            try:
+                opener.open(f"http://127.0.0.1:{port}/compress/status")
+                raise AssertionError("compress_status 未接入时应该失败")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 503
+            preview_request = urllib.request.Request(
+                f"http://127.0.0.1:{port}/recall/preview",
+                data=b'{"query":"x"}',
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                opener.open(preview_request)
+                raise AssertionError("recall_preview 未接入时应该失败")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 503
         finally:
             server.shutdown()
             server.server_close()
@@ -313,7 +493,14 @@ def _self_test() -> None:
         # Writable mode (runtime.viewer's use): bare page, /send reaches push.
         received: list[str] = []
         server = build_server(
-            task_dir, label="live", port=0, interval_ms=500, bare=True, push=received.append
+            task_dir,
+            label="live",
+            port=0,
+            interval_ms=500,
+            bare=True,
+            push=received.append,
+            recall_preview=lambda query: [f"echo:{query}"],
+            compress_status=lambda: {"enabled": True, "current_turn": 3},
         )
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -323,15 +510,61 @@ def _self_test() -> None:
                 body = response.read()
             assert b"const SAMPLES = {};" in body
             assert b"live-send" in body
-            request = urllib.request.Request(
-                f"http://127.0.0.1:{port}/send",
-                data=json.dumps({"text": "hello from the page"}).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with opener.open(request) as response:
-                assert json.loads(response.read()) == {"ok": True}
+            def post(sub_path: str, body: dict) -> tuple[int, dict]:
+                request = urllib.request.Request(
+                    f"http://127.0.0.1:{port}{sub_path}",
+                    data=json.dumps(body).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                try:
+                    with opener.open(request) as response:
+                        return response.status, json.loads(response.read())
+                except urllib.error.HTTPError as exc:
+                    return exc.code, json.loads(exc.read())
+
+            # N 区: IF-14/15, wired to fake runtime-bound callables.
+            with opener.open(f"http://127.0.0.1:{port}/compress/status") as response:
+                assert json.loads(response.read()) == {"enabled": True, "current_turn": 3}
+            status, reply = post("/recall/preview", {"query": "花生"})
+            assert (status, reply) == (200, {"results": ["echo:花生"]})
+            status, reply = post("/recall/preview", {"query": "  "})
+            assert status == 400 and "error" in reply
+
+            status, reply = post("/send", {"text": "hello from the page"})
+            assert (status, reply) == (200, {"ok": True})
             assert received == ["hello from the page"]
+
+            # C 区: IF-10~13, each just builds the equivalent command text.
+            status, reply = post("/compress", {})
+            assert (status, reply) == (200, {"ok": True})
+            assert received[-1] == MANUAL_COMPRESS_COMMAND
+
+            status, reply = post("/pin", {"content": "示例事实一"})
+            assert (status, reply) == (200, {"ok": True})
+            assert received[-1] == "/pin 示例事实一"
+
+            status, reply = post("/cancelpin", {"pin_id": "p01"})
+            assert (status, reply) == (200, {"ok": True})
+            assert received[-1] == "/cancelpin p01"
+
+            status, reply = post(
+                "/patch", {"element": "goal", "content": "ship it", "mode": "roll", "turns": 5}
+            )
+            assert (status, reply) == (200, {"ok": True})
+            assert received[-1] == "/goal ship it roll 5"
+
+            # Validation: malformed control requests 400 instead of reaching push.
+            before = len(received)
+            status, reply = post("/pin", {"content": "  "})
+            assert status == 400 and "error" in reply
+            status, reply = post("/patch", {"element": "goal", "content": "x", "mode": "bogus", "turns": 1})
+            assert status == 400 and "error" in reply
+            status, reply = post("/patch", {"element": "goal", "content": "x", "mode": "roll", "turns": 0})
+            assert status == 400 and "error" in reply
+            status, reply = post("/patch", {"element": "has space", "content": "x", "mode": "roll", "turns": 1})
+            assert status == 400 and "error" in reply
+            assert len(received) == before  # nothing invalid ever reached push
         finally:
             server.shutdown()
             server.server_close()

@@ -36,6 +36,7 @@ MODULES = (
     "code.manager.runtime",
     "code.saver.table_printer",
     "code.saver.live_view",
+    "code.saver.session_registry",
 )
 
 

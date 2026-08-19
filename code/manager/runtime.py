@@ -35,6 +35,7 @@ from ..recall import recall as recall_registry
 from ..registry import compact, dataset, manager, patch, provider as provider_registry, saver
 from ..saver import table_printer as _table_printer  # Register console printers.
 from ..saver import live_view as _live_view  # Register viewer.serve entry.
+from ..saver import session_registry as _session_registry  # Register session.*/hub.serve.
 
 
 History = dict[str, dict[str, dict[str, Any]]]
@@ -1400,6 +1401,77 @@ def _snapshot_tables(tables: DatasetTables, turn_id: int) -> None:
     print(f"[snapshot saved: {snapshot_dir}]")
 
 
+def _recall_preview(runtime: "RuntimeComponents") -> Callable[[str], list[str]]:
+    """IF-14: recall["grep"] reads its query from a history slot, not a bare
+    string (see code/recall/grep_recall.py) — so an ad-hoc preview query is
+    written into a scratch copy of history, one turn past the real last turn,
+    never touching runtime.tables or persisting anything. Bypasses the
+    trigger entirely, on purpose: this previews what recall *would* find, not
+    whether it would have fired."""
+
+    def preview(query: str) -> list[str]:
+        current_turn = _last_turn(runtime.tables.history)
+        preview_turn = current_turn + 1
+        scratch_history = dict(runtime.tables.history)
+        scratch_history[str(preview_turn)] = {INPUT_ELEMENT: {"content": query}}
+        return recall_registry["grep"](
+            history=scratch_history,
+            state=runtime.tables.state,
+            turn_id=preview_turn,
+            cfg=runtime.cfg,
+            query_element=INPUT_ELEMENT,
+            search_fields=runtime.recall_search_fields,
+        )
+
+    return preview
+
+
+def _compress_status(runtime: "RuntimeComponents") -> Callable[[], dict]:
+    """IF-15: thin read-only wrapper around the same due-checks and window
+    lookups `_maybe_compress` already uses — never triggers anything."""
+
+    def status() -> dict:
+        if not _compact_enabled(runtime.cfg):
+            return {"enabled": False}
+        current_turn = _last_turn(runtime.tables.history)
+        overload_threshold, _prompt, interval_turns, keep_recent_turns, fields = _compact_settings(
+            runtime.cfg
+        )
+        last_summary_turn = _last_summary_turn(runtime.tables.history)
+        periodic_runtime = ProcessorRuntime(last_run_turn=last_summary_turn)
+        due_periodic = is_due_periodic(
+            current_turn, periodic_runtime, step=interval_turns, first_run_turn=interval_turns
+        )
+        context_size = context_byte_size(runtime.tables.context)
+        due_overload = (
+            is_due_overload(context_size, threshold_bytes=overload_threshold)
+            if overload_threshold > 0
+            else False
+        )
+        end_turn = current_turn - keep_recent_turns
+        pending_from_turn = (
+            _first_uncompressed_turn(runtime.tables.history, runtime.tables.state, end_turn, fields)
+            if end_turn >= 1
+            else None
+        )
+        return {
+            "enabled": True,
+            "current_turn": current_turn,
+            "last_summary_turn": last_summary_turn,
+            "interval_turns": interval_turns,
+            "keep_recent_turns": keep_recent_turns,
+            "due_periodic": due_periodic,
+            "due_overload": due_overload,
+            "context_bytes": context_size,
+            "overload_threshold_bytes": overload_threshold,
+            "pending_from_turn": pending_from_turn,
+            "active_summary_anchors": _active_summary_anchors(runtime.tables.history, runtime.tables.state),
+            "all_summary_anchors": _all_summary_anchors(runtime.tables.history),
+        }
+
+    return status
+
+
 @manager("runtime.run")
 def run_runtime(runtime: RuntimeComponents) -> None:
     """Run configured input until EOF/close; provider generation is always streamed."""
@@ -1422,6 +1494,7 @@ def run_runtime(runtime: RuntimeComponents) -> None:
                 "[viewer] input_data.interface 不是 gui，网页里的输入框不会生效——"
                 "要用网页发消息，把 input_data.interface 改成 gui"
             )
+        session_id: str | None = None
         try:
             saver["viewer.serve"](
                 runtime.tables.paths.root,
@@ -1430,77 +1503,104 @@ def run_runtime(runtime: RuntimeComponents) -> None:
                 interval=viewer_interval,
                 open_browser=viewer_open,
                 push=viewer_push,
+                recall_preview=_recall_preview(runtime),
+                compress_status=_compress_status(runtime),
             )
         except Exception as exc:  # noqa: BLE001 - a busy port must never stop a run
             print(f"[viewer skipped: {exc}]")
-    while True:
-        try:
-            item = runtime.input_data.next()
-        except KeyboardInterrupt:
-            print()
-            break
-        except ValueError as exc:
-            print(f"[input error] {exc}")
-            continue
-        if item is None:
-            break
-        if item == MANUAL_COMPRESS_COMMAND:
-            _maybe_compress(runtime, manual_requested=True)
-            continue
-        if item == MANUAL_CHECK_COMMAND:
-            # One-off status dump on request, independent of the configured
-            # print type — normal conversation stays quiet by default; this
-            # is the escape hatch instead of switching the whole session to
-            # per-turn debug printing.
-            saver["print.tables"](
+        else:
+            # IF-17: register this session so the hub (IF-19) can list it.
+            # Best-effort like the viewer itself — a registry write failure
+            # must not stop a run that can already serve its own viewer fine.
+            try:
+                session_id = saver["session.register"](
+                    task=runtime.cfg.name,
+                    task_dir=runtime.tables.paths.root,
+                    port=viewer_port,
+                    label=runtime.cfg.name,
+                )
+                saver["hub.serve"]()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[session registry skipped: {exc}]")
+    else:
+        session_id = None
+    try:
+        while True:
+            try:
+                item = runtime.input_data.next()
+            except KeyboardInterrupt:
+                print()
+                break
+            except ValueError as exc:
+                print(f"[input error] {exc}")
+                continue
+            if item is None:
+                break
+            if item == MANUAL_COMPRESS_COMMAND:
+                _maybe_compress(runtime, manual_requested=True)
+                continue
+            if item == MANUAL_CHECK_COMMAND:
+                # One-off status dump on request, independent of the configured
+                # print type — normal conversation stays quiet by default; this
+                # is the escape hatch instead of switching the whole session to
+                # per-turn debug printing.
+                saver["print.tables"](
+                    history=runtime.tables.history,
+                    state=runtime.tables.state,
+                    context=runtime.tables.context,
+                    turn_id=_last_turn(runtime.tables.history),
+                )
+                continue
+            if isinstance(item, PinCommand):
+                _create_pin(runtime, item.content, origin="user")
+                continue
+            if isinstance(item, CancelPinCommand):
+                _cancel_pin(runtime, item.pin_id)
+                continue
+            if isinstance(item, DialogueInput):
+                for content_patch in item.patches:
+                    runtime.queue_patch(content_patch)
+                    print(
+                        f"[patch queued: turn={content_patch.created_turn} "
+                        f"element={content_patch.element} "
+                        f"mode={content_patch.mode.value}]"
+                    )
+                item = item.user
+            if isinstance(item, ContentPatch):
+                runtime.queue_patch(item)
+                print(
+                    f"[patch queued: turn={item.created_turn} "
+                    f"element={item.element} mode={item.mode.value}]"
+                )
+                continue
+
+            on_chunk = (
+                (lambda chunk: print(chunk, end="", flush=True))
+                if show_stream
+                else None
+            )
+            parsed = runtime.process_turn(item, on_chunk=on_chunk)
+            if show_stream:
+                print()
+            else:
+                print(parsed.assistant)
+            current_turn = _last_turn(runtime.tables.history)
+            runtime.printer(
                 history=runtime.tables.history,
                 state=runtime.tables.state,
                 context=runtime.tables.context,
-                turn_id=_last_turn(runtime.tables.history),
+                turn_id=current_turn,
             )
-            continue
-        if isinstance(item, PinCommand):
-            _create_pin(runtime, item.content, origin="user")
-            continue
-        if isinstance(item, CancelPinCommand):
-            _cancel_pin(runtime, item.pin_id)
-            continue
-        if isinstance(item, DialogueInput):
-            for content_patch in item.patches:
-                runtime.queue_patch(content_patch)
-                print(
-                    f"[patch queued: turn={content_patch.created_turn} "
-                    f"element={content_patch.element} "
-                    f"mode={content_patch.mode.value}]"
-                )
-            item = item.user
-        if isinstance(item, ContentPatch):
-            runtime.queue_patch(item)
-            print(
-                f"[patch queued: turn={item.created_turn} "
-                f"element={item.element} mode={item.mode.value}]"
-            )
-            continue
-
-        on_chunk = (
-            (lambda chunk: print(chunk, end="", flush=True))
-            if show_stream
-            else None
-        )
-        parsed = runtime.process_turn(item, on_chunk=on_chunk)
-        if show_stream:
-            print()
-        else:
-            print(parsed.assistant)
-        current_turn = _last_turn(runtime.tables.history)
-        runtime.printer(
-            history=runtime.tables.history,
-            state=runtime.tables.state,
-            context=runtime.tables.context,
-            turn_id=current_turn,
-        )
-        if snapshot_every_turns and current_turn % snapshot_every_turns == 0:
-            _snapshot_tables(runtime.tables, current_turn)
+            if snapshot_every_turns and current_turn % snapshot_every_turns == 0:
+                _snapshot_tables(runtime.tables, current_turn)
+    finally:
+        # IF-17: every exit path (EOF, Ctrl-C, an uncaught exception) drops
+        # this session from the registry so the hub never shows a ghost.
+        if session_id is not None:
+            try:
+                saver["session.deregister"](session_id)
+            except Exception:  # noqa: BLE001 - shutdown must never fail on this
+                pass
 
 
 def _self_test() -> None:
