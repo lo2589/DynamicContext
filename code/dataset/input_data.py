@@ -224,9 +224,30 @@ class DatasetInputProcessor:
         return self._json_records
 
     def _read_json_array(self) -> list[Any]:
+        """Read a prompt set from either a JSON array or a JSONL file.
+
+        JSONL is how every other ledger in this project is stored
+        (history.jsonl, patches.jsonl, raw_history.jsonl), so a prompt set
+        exported from one of them arrives one-record-per-line and used to be
+        rejected for not having a top-level array. Both shapes describe the
+        same list of records, and which one a file happens to use is not a
+        difference the input types should care about; the suffix decides.
+        """
+
         path = self._resolved_json_path()
+        text = path.read_text(encoding="utf-8")
+        if path.suffix == ".jsonl":
+            records: list[Any] = []
+            for number, line in enumerate(text.splitlines(), 1):
+                if not line.strip():
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError as exc:
+                    raise InputDataError(f"JSONL 格式错误: {path}:{number}") from exc
+            return records
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(text)
         except json.JSONDecodeError as exc:
             raise InputDataError(f"JSON 格式错误: {path}:{exc.lineno}") from exc
         if not isinstance(data, list):
@@ -422,6 +443,10 @@ def _self_test() -> None:
             json.dumps(["same", "same", "last"], ensure_ascii=False),
             encoding="utf-8",
         )
+        jsonl_path = root / "prompts.jsonl"
+        jsonl_path.write_text(
+            '{"user": "j1"}\n\n{"user": "j2"}\n', encoding="utf-8"
+        )
         user_answer_path = root / "user_answer.json"
         user_answer_path.write_text(
             json.dumps(
@@ -499,6 +524,13 @@ def _self_test() -> None:
         assert duplicate_resume.next() == "same"
         assert duplicate_resume.next() == "last"
         assert duplicate_resume.next() is None
+
+        jsonl_only = DatasetInputProcessor(
+            cfg, input_type="user_only_json", json_path=jsonl_path
+        )
+        assert jsonl_only.next() == "j1"
+        assert jsonl_only.next() == "j2"
+        assert jsonl_only.next() is None
 
         user_answer = DatasetInputProcessor(
             cfg,

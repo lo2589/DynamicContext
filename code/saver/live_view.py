@@ -101,6 +101,19 @@ SEND_BAR = """
   border-radius:6px;background:var(--live);color:var(--paper);cursor:pointer;
   font:inherit;font-size:12.5px;white-space:nowrap}
 #live-send button:disabled{opacity:.5;cursor:default}
+#live-stop{background:transparent;color:var(--mark);border-color:var(--mark)}
+#live-settings{margin-left:6px;padding:3px 9px;border:1px solid var(--rule);border-radius:6px;
+  background:transparent;color:var(--ink-2);font:inherit;font-size:11px;cursor:pointer}
+#live-settings:hover{border-color:var(--live);color:var(--live)}
+#live-settings-panel{display:none;flex-direction:column;gap:7px;padding:11px 14px;
+  border-top:1px solid var(--rule);background:var(--panel);font-size:12px}
+#live-settings-panel.open{display:flex}
+#live-settings-panel .hint{color:var(--ink-2);font-size:11px;line-height:1.5}
+.sc-row{display:grid;grid-template-columns:7rem 1fr 4rem;gap:7px;align-items:center}
+.sc-row select,.sc-row input{padding:5px 7px;border:1px solid var(--rule);border-radius:6px;
+  background:var(--paper);color:var(--ink);font:inherit;font-size:11.5px}
+#live-settings-apply{align-self:flex-start;padding:6px 13px;border:1px solid var(--live);
+  border-radius:6px;background:var(--live);color:var(--paper);font:inherit;font-size:12px;cursor:pointer}
 #live-send .status{color:var(--ink-2);font-size:11.5px;min-width:7em}
 /* The in-progress reply is a message, so it is rendered as one, in the
    transcript, using the viewer's own bubble classes — .b.t for reasoning and
@@ -148,6 +161,7 @@ SEND_BAR = """
   <div class="row">
     <textarea id="live-send-text" rows="2" placeholder="跟这个 run 说点什么…（回车换行，⌘/Ctrl+回车 或点 Send 发送）"></textarea>
     <button id="live-send-btn">Send</button>
+    <button id="live-stop" type="button" hidden>停止</button>
     <span class="status" id="live-send-status"></span>
   </div>
 </div>
@@ -165,6 +179,17 @@ SEND_BAR = """
   // #chat only when new data lands, and when it does this turn has committed
   // — so the placeholder is replaced by the real thing at exactly the right
   // moment, with no cleanup race.
+  var stopBtn = document.getElementById("live-stop")
+  stopBtn.onclick = function () {
+    stopBtn.disabled = true
+    // The runtime treats a stop as a successful partial generation, so what
+    // was produced up to here is parsed and committed like any other turn.
+    fetch("/interrupt", { method: "POST" })
+      .then(function (r) { return r.json() })
+      .then(function (d) { if (!d.ok) status.textContent = d.reason || "停不了" })
+      .catch(function () {})
+  }
+
   var live = document.createElement("div")
   live.id = "live-provisional"
   if (chat && chat.parentNode) chat.parentNode.insertBefore(live, bar)
@@ -235,6 +260,7 @@ SEND_BAR = """
           clearInterval(fast)
           status.textContent = message || ""
           pendingUser = ""
+          stopBtn.hidden = true
           renderLive("")
           window.__liveTick()  // make sure the committed turn is on screen
         }
@@ -250,6 +276,8 @@ SEND_BAR = """
               if (!s) return
               if (s.active) {
                 sawActive = true
+                stopBtn.hidden = false
+                stopBtn.disabled = false
                 var secs = Math.round((Date.now() - started) / 1000)
                 status.textContent = "generating " + secs + "s"
                 renderLive(s.text)
@@ -301,7 +329,8 @@ SEND_BAR = """
   var head = document.createElement("span")
   head.id = "live-head"
   head.innerHTML = '<select id="live-session"></select>' +
-    '<button id="live-new" type="button">＋ 新对话</button>'
+    '<button id="live-new" type="button">＋ 新对话</button>' +
+    '<button id="live-settings" type="button">设置</button>'
   // The Conversation pane's heading — the row that already reads
   // "Conversation · N slots · M exchanges".
   var h2 = chat && chat.parentNode ? chat.parentNode.querySelector("h2") : null
@@ -399,6 +428,105 @@ SEND_BAR = """
   // Token counts change with every commit, so follow the same cadence as the
   // transcript rather than a slow independent timer.
   setInterval(refreshTokens, 2000)
+
+  // ---- settings: change the declarations of a running conversation ----
+  var settingsBtn = document.getElementById("live-settings")
+  var panel = document.createElement("div")
+  panel.id = "live-settings-panel"
+  panel.innerHTML =
+    '<div class="hint">改声明不动账本：history 一个字不变，整张表按新规则从第 0 轮重算。' +
+    '这正是 state = π(流, 声明) 的意思。</div>' +
+    '<div id="sc-rows"></div>' +
+    '<button id="live-settings-apply" type="button">应用并重算</button>' +
+    '<span class="status" id="sc-status"></span>'
+  if (chat && chat.parentNode) chat.parentNode.insertBefore(panel, bar)
+
+  var RULES = [
+    {id: "", label: "一直在场"},
+    {id: "born", label: "只在出生那轮"},
+    {id: "born+n", label: "出生后再留 n 轮"},
+    {id: "until_cancelled", label: "钉住直到取消"},
+    {id: "cycle", label: "被指回时缺席"},
+    {id: "labelled", label: "按数据集标记"},
+    {id: "until_goal_end", label: "直到 goal 结束"},
+  ]
+  var declared = {}
+
+  function ruleOf(end) {
+    if (end === null || end === undefined || end === "") return {rule: "", n: 3}
+    if (typeof end === "string" && end.indexOf("born+") === 0) {
+      return {rule: "born+n", n: parseInt(end.slice(5), 10) || 3}
+    }
+    return {rule: String(end), n: 3}
+  }
+
+  function renderSettings() {
+    var host = document.getElementById("sc-rows")
+    host.innerHTML = ""
+    Object.keys(declared).forEach(function (element) {
+      var bound = declared[element]
+      // system is turn 0's slot, declared as a literal range rather than by
+      // an end-function; editing it here would be a category error.
+      if (element === "system") return
+      var picked = ruleOf(bound[1])
+      var row = document.createElement("div")
+      row.className = "sc-row"
+      row.innerHTML = "<span>" + element + "</span>" +
+        "<select>" + RULES.map(function (r) {
+          return '<option value="' + r.id + '"' + (r.id === picked.rule ? " selected" : "") +
+            ">" + r.label + "</option>"
+        }).join("") + "</select>" +
+        '<input type="number" min="1" value="' + picked.n + '"' +
+          (picked.rule === "born+n" ? "" : " hidden") + ">"
+      var sel = row.querySelector("select")
+      var num = row.querySelector("input")
+      sel.onchange = function () {
+        num.hidden = sel.value !== "born+n"
+        declared[element] = [bound[0], boundValue(sel.value, num.value)]
+        renderSettings()
+      }
+      num.oninput = function () {
+        declared[element] = [bound[0], boundValue(sel.value, num.value)]
+      }
+      host.appendChild(row)
+    })
+  }
+
+  function boundValue(rule, n) {
+    if (!rule) return null
+    if (rule === "born+n") return "born+" + Math.max(1, parseInt(n || "1", 10))
+    return rule
+  }
+
+  settingsBtn.onclick = function () {
+    panel.classList.toggle("open")
+    if (!panel.classList.contains("open")) return
+    fetch("/settings", { cache: "no-store" })
+      .then(function (r) { return r.ok ? r.json() : null })
+      .then(function (d) {
+        if (!d) return
+        declared = d.life_cycle || {}
+        renderSettings()
+      })
+      .catch(function () {})
+  }
+
+  document.getElementById("live-settings-apply").onclick = function () {
+    var out = document.getElementById("sc-status")
+    out.textContent = "重算中…"
+    fetch("/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ life_cycle: declared }),
+    })
+      .then(function (r) { return r.json().then(function (d) { if (!r.ok) throw new Error(d.error); return d }) })
+      .then(function (d) {
+        out.textContent = "已重算：" + d.visible + " 个槽位在场 · context " + d.context_messages + " 条"
+        window.__liveTick()
+        refreshTokens()
+      })
+      .catch(function (e) { out.textContent = "失败：" + e.message })
+  }
 
   // ---- model picker ----
   var now = document.getElementById("live-model-now")
@@ -563,6 +691,9 @@ class Handler(BaseHTTPRequestHandler):
         model_switch: Callable[[dict], dict] | None = None,
         last_error: Callable[[], str | None] | None = None,
         streaming: Callable[[], dict] | None = None,
+        interrupt: Callable[[], dict] | None = None,
+        settings_read: Callable[[], dict] | None = None,
+        settings_write: Callable[[dict], dict] | None = None,
         **kwargs,
     ) -> None:
         self.task_dir = task_dir
@@ -574,6 +705,9 @@ class Handler(BaseHTTPRequestHandler):
         self.model_switch = model_switch
         self.last_error = last_error
         self.streaming = streaming
+        self.interrupt = interrupt
+        self.settings_read = settings_read
+        self.settings_write = settings_write
         super().__init__(*args, **kwargs)
 
     def _send(self, payload: bytes, mime: str, *, status: int = 200) -> None:
@@ -641,6 +775,11 @@ class Handler(BaseHTTPRequestHandler):
             # and a 503 there would read as "the send failed" rather than
             # "this page has no runtime to report errors from".
             self._send_json({"error": self.last_error() if self.last_error else None})
+        elif path == "/settings":
+            if self.settings_read is None:
+                self._send_json({"error": "此页面没有接到可写入的 runtime"}, status=503)
+                return
+            self._send_json(self.settings_read())
         elif path == "/tokens":
             self._send_json(self._token_stats())
         elif path == "/sessions":
@@ -792,6 +931,27 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/model":
             self._handle_model_switch()
             return
+        if path == "/interrupt":
+            if self.interrupt is None:
+                self._send_json({"error": "此页面没有接到可写入的 runtime"}, status=503)
+                return
+            self._send_json(self.interrupt())
+            return
+        if path == "/settings":
+            if self.settings_write is None:
+                self._send_json({"error": "此页面没有接到可写入的 runtime"}, status=503)
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                payload = json.loads(self.rfile.read(length) or b"{}")
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                self._send_json({"error": "invalid JSON body"}, status=400)
+                return
+            try:
+                self._send_json(self.settings_write(payload))
+            except (ValueError, AssertionError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+            return
         if path == "/new-run":
             from .launcher import ensure_launcher
 
@@ -883,6 +1043,9 @@ def build_server(
     model_switch: Callable[[dict], dict] | None = None,
     last_error: Callable[[], str | None] | None = None,
     streaming: Callable[[], dict] | None = None,
+    interrupt: Callable[[], dict] | None = None,
+    settings_read: Callable[[], dict] | None = None,
+    settings_write: Callable[[dict], dict] | None = None,
 ) -> ThreadingHTTPServer:
     if not VIEWER.is_file():
         raise SystemExit(f"{VIEWER} 不存在")
@@ -898,6 +1061,9 @@ def build_server(
         model_switch=model_switch,
         last_error=last_error,
         streaming=streaming,
+        interrupt=interrupt,
+        settings_read=settings_read,
+        settings_write=settings_write,
     )
     return ThreadingHTTPServer(("127.0.0.1", port), handler)
 
@@ -918,6 +1084,9 @@ def start_viewer(
     model_switch: Callable[[dict], dict] | None = None,
     last_error: Callable[[], str | None] | None = None,
     streaming: Callable[[], dict] | None = None,
+    interrupt: Callable[[], dict] | None = None,
+    settings_read: Callable[[], dict] | None = None,
+    settings_write: Callable[[dict], dict] | None = None,
 ) -> ThreadingHTTPServer:
     """Serve the live viewer for ``task_dir`` in a background thread.
 
@@ -938,6 +1107,9 @@ def start_viewer(
         model_switch=model_switch,
         last_error=last_error,
         streaming=streaming,
+        interrupt=interrupt,
+        settings_read=settings_read,
+        settings_write=settings_write,
     )
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{port}/"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -32,7 +33,15 @@ from ..lifecycle.rules import end_functions
 from ..patch.state_patch import ContentPatch, ContentPatchMode
 from ..provider import ParsedAnswer, build_provider_from_cfg
 from ..recall import recall as recall_registry
-from ..registry import compact, dataset, manager, patch, provider as provider_registry, saver
+from ..registry import (
+    compact,
+    dataset,
+    lifecycle as lifecycle_registry,
+    manager,
+    patch,
+    provider as provider_registry,
+    saver,
+)
 from ..saver import table_printer as _table_printer  # Register console printers.
 from ..saver import live_view as _live_view  # Register viewer.serve entry.
 from ..saver import session_registry as _session_registry  # Register session.*/hub.serve.
@@ -1070,6 +1079,13 @@ class RuntimeComponents:
     # — the browser's equivalent of watching the stream scroll in a terminal.
     streaming: str = ""
     streaming_active: bool = False
+    # IF-16. Set from another thread (the viewer's HTTP handler) to stop the
+    # turn in flight. Checked in on_chunk rather than plumbed into the
+    # provider: chat.normal already treats a KeyboardInterrupt raised anywhere
+    # in its streaming loop as a successful partial generation, so raising it
+    # from the callback reuses that path exactly — the partial answer is
+    # parsed and committed like any other, and no provider learns a new trick.
+    cancel_requested: bool = False
 
     def queue_patch(self, content_patch: ContentPatch) -> None:
         if content_patch.created_turn is None:
@@ -1614,6 +1630,125 @@ def _model_switch(runtime: "RuntimeComponents") -> Callable[[dict], dict]:
     return switch
 
 
+def _settings_read(runtime: "RuntimeComponents") -> Callable[[], dict]:
+    """What this run is currently declaring, for a settings panel to edit."""
+
+    def read() -> dict:
+        data = runtime.cfg.to_dict()
+        compact_cfg = data.get("compact")
+        compact_cfg = compact_cfg if isinstance(compact_cfg, dict) else {}
+        summary = ((compact_cfg.get("compressors") or {}).get("summary") or {})
+        periodic = summary.get("periodic") or {}
+        return {
+            "life_cycle": runtime.tables.life_cycle,
+            "elements": sorted(
+                {element for content in runtime.tables.history.values() for element in content}
+            ),
+            "compact_enabled": bool(compact_cfg),
+            "interval_turns": periodic.get("interval_turns"),
+            "keep_recent_turns": periodic.get("keep_recent_turns"),
+            "system": (data.get("runtime") or {}).get("system", {}).get("content", ""),
+            "yaml_path": str(runtime.cfg.source_path),
+        }
+
+    return read
+
+
+def _settings_write(runtime: "RuntimeComponents") -> Callable[[dict], dict]:
+    """Change the declarations of a running conversation and re-project.
+
+    This is only sound because of how the runtime is built: state and context
+    are a projection of the ledger through the declarations
+    (README: ``state = π(流, 声明)``, "改声明不用回溯改数据"). So editing
+    life_cycle mid-run is not a migration — nothing in history.jsonl is
+    touched. The whole timetable is simply recomputed from turn 0 under the
+    new rules, which is exactly what the viewer then draws.
+
+    The new declaration is written to both life_cycle.json (what the running
+    tables read) and the task YAML (what a restart reads); leaving either
+    behind would make the two disagree the moment the process restarts.
+    """
+
+    def write(payload: dict) -> dict:
+        declared = payload.get("life_cycle")
+        if not isinstance(declared, dict) or not declared:
+            raise ValueError("life_cycle 必须是非空 mapping")
+
+        normalized: dict[str, Any] = {}
+        for element, bound in declared.items():
+            if not isinstance(bound, list) or len(bound) != 2:
+                raise ValueError(f"{element} 的声明必须是 [起, 止]")
+            start, end = bound
+            # Reject an unknown end-function here rather than letting every
+            # later turn fail inside the lifecycle engine.
+            if isinstance(end, str) and end:
+                name = end.split("+", 1)[0] if end.startswith("born+") else end
+                try:
+                    lifecycle_registry[name]
+                except KeyError as exc:
+                    raise ValueError(f"{element}: 未注册的结束函数 {end!r}") from exc
+            normalized[str(element)] = [start, end]
+
+        current_turn = _last_turn(runtime.tables.history)
+        history = copy.deepcopy(runtime.tables.history)
+        lifecycle: FixedTableLifecycle = manager["lifecycle.fixed"](
+            history, normalized, current_turn=current_turn
+        )
+        lifecycle.validate()
+        state = lifecycle.state_snapshot()
+        context = runtime.select_context(
+            history, state, through_turn=current_turn, roles=runtime.element_roles
+        )
+
+        saver["life_cycle.save"](runtime.tables, normalized)
+        saver["history.save"](runtime.tables, history)
+        saver["state.save"](runtime.tables, state)
+        saver["context.save"](runtime.tables, context)
+        _write_life_cycle_to_yaml(runtime.cfg, normalized)
+        print(f"[life_cycle updated] {normalized}")
+        return {
+            "ok": True,
+            "life_cycle": normalized,
+            "visible": sum(1 for row in state.values() for value in row.values() if value == 1),
+            "context_messages": len(context),
+        }
+
+    return write
+
+
+def _write_life_cycle_to_yaml(cfg: Any, life_cycle: dict) -> None:
+    """Mirror the new declaration into the task YAML, in place."""
+
+    from pathlib import Path
+
+    path = Path(cfg.source_path)
+    text = path.read_text(encoding="utf-8")
+    lines = ["life_cycle:"]
+    for element, (start, end) in life_cycle.items():
+        start_text = "born" if start == "born" else json.dumps(start)
+        end_text = "null" if end is None else str(end)
+        if element == "system":
+            lines.append(f"  {element}: [{start_text}, {end_text}]")
+        else:
+            lines.append(f"  {element}: [{start_text}, {end_text}]")
+    path.write_text(
+        re.sub(r"^life_cycle:\n(?:  .*\n)+", "\n".join(lines) + "\n", text, count=1, flags=re.M),
+        encoding="utf-8",
+    )
+
+
+def _interrupt(runtime: "RuntimeComponents") -> Callable[[], dict]:
+    """IF-16: ask the turn in flight to stop where it is."""
+
+    def interrupt() -> dict:
+        if not runtime.streaming_active:
+            return {"ok": False, "reason": "现在没有正在生成的回答"}
+        runtime.cancel_requested = True
+        return {"ok": True}
+
+    return interrupt
+
+
 def _recall_preview(runtime: "RuntimeComponents") -> Callable[[str], list[str]]:
     """IF-14: recall["grep"] reads its query from a history slot, not a bare
     string (see code/recall/grep_recall.py) — so an ad-hoc preview query is
@@ -1729,6 +1864,9 @@ def run_runtime(runtime: RuntimeComponents) -> None:
                     "text": runtime.streaming,
                     "active": runtime.streaming_active,
                 },
+                interrupt=_interrupt(runtime),
+                settings_read=_settings_read(runtime),
+                settings_write=_settings_write(runtime),
             )
         except Exception as exc:  # noqa: BLE001 - a busy port must never stop a run
             print(f"[viewer skipped: {exc}]")
@@ -1748,6 +1886,8 @@ def run_runtime(runtime: RuntimeComponents) -> None:
                 print(f"[session registry skipped: {exc}]")
     else:
         session_id = None
+    last_input_error: str | None = None
+    repeated_input_errors = 0
     try:
         while True:
             try:
@@ -1756,7 +1896,21 @@ def run_runtime(runtime: RuntimeComponents) -> None:
                 print()
                 break
             except ValueError as exc:
-                print(f"[input error] {exc}")
+                # A malformed line is worth skipping; a source that fails the
+                # same way every time is not, and `continue` alone turned that
+                # into a hot loop printing the identical error thousands of
+                # times (a dataset path that does not exist does exactly
+                # this). Retry a few times, then stop and say why.
+                message = str(exc)
+                if message == last_input_error:
+                    repeated_input_errors += 1
+                else:
+                    last_input_error, repeated_input_errors = message, 1
+                print(f"[input error] {message}")
+                if repeated_input_errors >= 3:
+                    runtime.last_error = f"输入源持续失败，已停止：{message}"
+                    print("[input source failed repeatedly; stopping]")
+                    break
                 continue
             if item is None:
                 break
@@ -1805,8 +1959,11 @@ def run_runtime(runtime: RuntimeComponents) -> None:
             # buffer the page polls (GET /streaming).
             runtime.streaming = ""
             runtime.streaming_active = True
+            runtime.cancel_requested = False
 
             def on_chunk(chunk: str) -> None:
+                if runtime.cancel_requested:
+                    raise KeyboardInterrupt
                 runtime.streaming += chunk
                 if show_stream:
                     print(chunk, end="", flush=True)
@@ -1827,6 +1984,9 @@ def run_runtime(runtime: RuntimeComponents) -> None:
                 continue
             runtime.last_error = None
             runtime.streaming_active = False
+            if runtime.cancel_requested:
+                runtime.cancel_requested = False
+                print("\n[stopped by user; partial answer committed]")
             if show_stream:
                 print()
             else:

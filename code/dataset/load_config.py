@@ -595,7 +595,7 @@ def _self_test() -> None:
     assert cfg.input_data.type == "real_user"
     assert cfg.input_data.interface == "input"
     assert cfg.dataset.kwargs.tables.history == "history.jsonl"
-    assert cfg.context.compat.m == 20
+    assert cfg.context.patch_end.enabled is True
     try:
         _ = cfg.dataset.kwargs.missing_field
     except ConfigFieldError as exc:

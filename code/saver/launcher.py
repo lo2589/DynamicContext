@@ -89,18 +89,56 @@ def _options() -> dict[str, Any]:
             {"id": "json_then_user", "label": "数据集跑完再接手打字", "needs_path": True},
         ],
         "datasets": _datasets(),
+        "histories": _histories(),
     }
 
 
-def _datasets() -> list[str]:
-    """JSON files that could serve as an input dataset, repo-relative."""
-    found: list[str] = []
-    for base in (REPO_ROOT / "task", REPO_ROOT / "data", REPO_ROOT / "dataset"):
+def _histories() -> list[dict[str, Any]]:
+    """Existing ledgers that a new run could be seeded from.
+
+    Continuing someone else's conversation needs nothing but their
+    history.jsonl: state and context are projections, so they are recomputed
+    from the copied ledger at startup rather than carried along
+    (README: 状态文件可以删除后重算). The YAML is the other half of the pair
+    and is supplied by whatever you pick here — that is the choice being made.
+    """
+
+    found: list[dict[str, Any]] = []
+    for base in (REPO_ROOT / "task", REPO_ROOT / "data"):
         if not base.is_dir():
             continue
-        for path in sorted(base.rglob("*.json")):
-            # Outputs and bookkeeping, not input datasets: the fixed tables a
-            # run writes, the cross-session registry, and anything hidden.
+        for path in sorted(base.rglob("*.jsonl")):
+            if path.name != "history.jsonl" or "snapshots" in path.parts:
+                continue
+            if any(part.startswith(".") for part in path.relative_to(REPO_ROOT).parts):
+                continue
+            turns = sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+            found.append(
+                {
+                    "path": str(path.relative_to(REPO_ROOT)),
+                    "turns": max(0, turns - 1),
+                }
+            )
+    return found
+
+
+def _datasets() -> list[str]:
+    """Prompt sets that could drive a run, repo-relative.
+
+    Both .json (a top-level array) and .jsonl (one record per line) qualify —
+    the reader accepts either, and JSONL is what anything exported from this
+    project's own ledgers looks like.
+    """
+
+    found: list[str] = []
+    for base in (REPO_ROOT / "data", REPO_ROOT / "dataset", REPO_ROOT / "task"):
+        if not base.is_dir():
+            continue
+        candidates = sorted(base.rglob("*.json")) + sorted(base.rglob("*.jsonl"))
+        for path in candidates:
+            # A run's own ledgers are outputs, not prompt sets.
+            if path.name in {"history.jsonl", "patches.jsonl", "raw_history.jsonl"}:
+                continue
             if path.name in {"state_latest.json", "context_latest.json", "life_cycle.json"}:
                 continue
             if any(part.startswith(".") for part in path.relative_to(REPO_ROOT).parts):
@@ -347,9 +385,14 @@ def build_yaml(
     # Y-05/Y-06: where the turns come from.
     text = re.sub(r"^  type: real_user$", f"  type: {input_type}", text, count=1, flags=re.M)
     if input_path:
+        # input_data.path is resolved against the YAML's own directory
+        # (_resolved_json_path), and this YAML lives in the task dir — so a
+        # repo-relative path picked in the panel would be looked up under
+        # task/<name>/. Store it absolute; the file is outside this run.
+        resolved = (REPO_ROOT / input_path).resolve()
         text = re.sub(
             r"^  path: null$",
-            f"  path: {json.dumps(input_path, ensure_ascii=False)}",
+            f"  path: {json.dumps(str(resolved), ensure_ascii=False)}",
             text,
             count=1,
             flags=re.M,
@@ -508,6 +551,18 @@ def create_run(payload: dict) -> dict:
         text = re.sub(r"^  interface: .*$", "  interface: gui", text, count=1, flags=re.M)
         yaml_path.write_text(text, encoding="utf-8")
         print(f"[adopted yaml] {source} -> {yaml_path}")
+
+    seed = str(payload.get("seed_history") or "").strip()
+    if seed and not history_path.is_file():
+        source_history = (REPO_ROOT / seed).resolve()
+        if not source_history.is_file() or REPO_ROOT not in source_history.parents:
+            raise ValueError(f"找不到这份 history.jsonl：{seed}")
+        task_dir.mkdir(parents=True, exist_ok=True)
+        # Only the ledger is copied. state/context/life_cycle are projections
+        # and are rebuilt from it on startup, so carrying them over would just
+        # risk pairing this ledger with someone else's stale snapshot.
+        history_path.write_text(source_history.read_text(encoding="utf-8"), encoding="utf-8")
+        print(f"[seeded] {source_history} -> {history_path}")
 
     task_dir.mkdir(parents=True, exist_ok=True)
     resuming = yaml_path.exists()
@@ -728,6 +783,10 @@ button.go:disabled{opacity:.55;cursor:default}
   <label for="system">系统提示词</label>
   <textarea id="system" rows="2"></textarea>
 
+  <label for="seed">从一份 history.jsonl 接着聊（可选）</label>
+  <select id="seed"><option value="">— 从空白开始 —</option></select>
+  <div class="hint">只复制账本；state / context 是投影，启动时按这份 yaml 的声明重算。</div>
+
   <div class="two">
     <div>
       <label for="input-type">对话从哪来</label>
@@ -831,6 +890,11 @@ fetch("/options").then(function (r) { return r.json() }).then(function (d) {
   ;(d.input_types || []).forEach(function (it) {
     var o = document.createElement("option"); o.value = it.id; o.textContent = it.label
     $("input-type").appendChild(o)
+  })
+  ;(d.histories || []).forEach(function (h) {
+    var o = document.createElement("option")
+    o.value = h.path; o.textContent = h.path + "（" + h.turns + " 轮）"
+    $("seed").appendChild(o)
   })
   ;(d.datasets || []).forEach(function (f) {
     var o = document.createElement("option"); o.value = f; o.textContent = f
@@ -1002,6 +1066,7 @@ $("go").onclick = function () {
       compact: $("compact").checked,
       port: $("port").value,
       slots: slots,
+      seed_history: $("seed").value,
       input_type: $("input-type").value,
       input_path: $("dataset").disabled ? "" : $("dataset").value,
       compact_interval: $("c-interval").value,
@@ -1169,7 +1234,9 @@ def _self_test() -> None:
         assert life["recall"] == ["born", "born"]      # required once recall is on
         # Y-05/Y-06
         assert cfg.input_data.type == "user_only_json"
-        assert cfg.input_data.path == "task/demo/prompts.json"
+        # Stored absolute on purpose: relative would resolve against the task
+        # directory the YAML lives in, not the repo.
+        assert cfg.input_data.path == str((REPO_ROOT / "task/demo/prompts.json").resolve())
         # Y-11~15
         assert cfg.compact.overload_threshold_bytes == 12000
         assert cfg.compact.compressors.summary.periodic.interval_turns == 5

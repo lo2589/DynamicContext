@@ -51,15 +51,6 @@ dataset:
       compression: compression
       raw: raw_history.jsonl
 
-rolling_front_params: &rolling_front_params
-  m: 20
-  k: 10
-  keep_recent_raw_turns: 10
-  elements: [user, answer]
-  density: 0.3
-  compressor: summary
-  drop_temporary_retained: true
-
 recall: &recall
   type: none
   build: none
@@ -79,20 +70,8 @@ runtime:
     port: 8777
     interval: 1.0
     open: true
-  lifecycle: [begin_turn, llm_call, end_turn]
-  pipeline:
-    begin_turn:
-      - clean: context.clean
-      - forward: memory.forward
-    llm_call:
-      - recall: *recall
-      - llm: provider.chat
-    end_turn:
-      - archive: memory.archive
-      - compat_check: memory.compat
 
 context:
-  state_model: field_turn_table
   selector: none
   required_elements: [user, assistant]
   roles:
@@ -102,27 +81,4 @@ context:
   patch_end:
     enabled: true
     template: "以上{element}已经结束，不再继续执行：{content}。请按当前用户请求正常回答。"
-  type: stateful_archive
-  registry: memory_registry.json
-  restorer: mechanical
-  keep_history: true
-  lifecycles:
-    goal: temporary_retained_goal
-    constraint: rolling_single
-    user: persistent_once
-    answer: persistent_once
-    think: ephemeral
-    tool_call: ephemeral
-    tool_result: ephemeral
-    memory_state: rolling_single
   patches: {}
-  clean:
-    system_cycle: context.lifecycles
-  compat:
-    trigger: before_context
-    policy: rolling_front_compress
-    <<: *rolling_front_params
-  forward:
-    order: [system, active_elements, dialogue_history, current_user]
-    include_roles: [system, user, assistant, memory]
-    use_active_compression_state: true
