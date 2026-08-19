@@ -118,7 +118,7 @@ SEND_BAR = """
 /* The in-progress reply is a message, so it is rendered as one, in the
    transcript, using the viewer's own bubble classes — .b.t for reasoning and
    .b.a for the answer, exactly as a committed turn looks. */
-#live-provisional{display:flex;flex-direction:column;gap:9px;padding:0 14px 6px}
+#live-provisional{display:flex;flex-direction:column;gap:9px}
 #live-provisional .b{animation:livepulse 1.4s ease-in-out infinite}
 @keyframes livepulse{0%,100%{opacity:.62}50%{opacity:1}}
 #live-model{color:var(--ink-2);font-size:11px;letter-spacing:.04em;
@@ -190,9 +190,18 @@ SEND_BAR = """
       .catch(function () {})
   }
 
+  // Provisional bubbles go inside the transcript, as its last children.
+  // Sitting outside it put the message you just sent in a separate block
+  // below the conversation — which is where "my input showed up at the
+  // bottom" came from. render() rewrites #chat wholesale, so re-attach on
+  // every draw rather than placing it once.
   var live = document.createElement("div")
   live.id = "live-provisional"
-  if (chat && chat.parentNode) chat.parentNode.insertBefore(live, bar)
+
+  function attachLive() {
+    if (chat && live.parentNode !== chat) chat.appendChild(live)
+  }
+  attachLive()
 
   // The stream carries the model's raw markup (<think>…</think> then the
   // answer). Split it the same way the ledger will, so what is shown while
@@ -206,6 +215,7 @@ SEND_BAR = """
 
   function renderLive(text) {
     if (!text && !pendingUser) { live.innerHTML = ""; return }
+    attachLive()
     var think = "", answer = text || ""
     var open = text.indexOf("<think>")
     if (open !== -1) {
@@ -225,8 +235,9 @@ SEND_BAR = """
       html += '<div class="b a"><span class="tag">assistant · generating</span>' +
         escapeHtml(answer.trim()) + "</div>"
     }
+    attachLive()
     live.innerHTML = html
-    live.scrollIntoView({ block: "end" })
+    if (chat) chat.scrollTop = chat.scrollHeight
   }
 
   function escapeHtml(s) {
@@ -1159,6 +1170,100 @@ def _assert_js_parses(html: str) -> None:
             stripped = re.sub(r"//.*", "", stripped)
             if stripped.count('"') % 2:
                 raise AssertionError(f"script[{index}] L{number} 双引号未闭合：{line.strip()[:80]}")
+    _assert_no_undefined_calls(html)
+
+
+# Names the injected scripts may use without declaring them: browser builtins,
+# plus what viewer.html itself defines above them.
+_JS_GLOBALS = frozenset({
+    "fetch", "setInterval", "clearInterval", "setTimeout", "clearTimeout",
+    "parseInt", "parseFloat", "String", "Number", "Boolean", "Array", "Object",
+    "JSON", "Math", "Date", "Error", "Set", "Map", "Promise", "RegExp",
+    "document", "window", "location", "console", "isNaN", "alert",
+    "encodeURIComponent", "decodeURIComponent", "FileReader",
+    # viewer.html's own, which the injected scripts are appended after.
+    "load", "setTurn", "stop", "render", "parse", "pick", "readFile",
+})
+
+# Words that begin a block or expression and are followed by "(" — they read
+# like calls to the pattern below but are syntax.
+_JS_KEYWORDS = frozenset({
+    "if", "for", "while", "switch", "catch", "return", "typeof", "function",
+    "new", "delete", "void", "in", "of", "do", "else", "await", "yield",
+})
+
+
+def _strip_js_literals(source: str) -> str:
+    """Remove comments and string contents so prose cannot look like code.
+
+    The page carries recorded sample conversations inside string literals, and
+    a sentence such as "David (age 40)" matches a call pattern perfectly. Only
+    executable text may be scanned.
+    """
+
+    # A scanner, not a regex. Quoting here is genuinely stateful — a double
+    # quote inside a single-quoted string (`'<option value="'`) is data, not a
+    # delimiter — and regex alternation gets the pairing wrong as soon as one
+    # such quote appears, which inverted an earlier version of this: it kept
+    # the string contents and deleted the code between them.
+    out: list[str] = []
+    quote: str | None = None
+    index = 0
+    length = len(source)
+    while index < length:
+        char = source[index]
+        if quote:
+            if char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+                out.append('""')
+            index += 1
+            continue
+        if char in "\"'`":
+            quote = char
+            index += 1
+            continue
+        if char == "/" and index + 1 < length:
+            following = source[index + 1]
+            if following == "/":
+                end = source.find("\n", index)
+                index = length if end == -1 else end
+                continue
+            if following == "*":
+                end = source.find("*/", index + 2)
+                index = length if end == -1 else end + 2
+                continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def _assert_no_undefined_calls(html: str) -> None:
+    """Catch a call to a name the injected script never defines.
+
+    `node --check` only parses; it cannot know that `attachLive()` refers to
+    nothing. That is exactly how a silently non-matching edit shipped a page
+    whose composer threw "Can't find variable" on the first click while every
+    test still passed — the failure is at first call, not at parse.
+
+    Only the scripts this module appends are checked. They come after the
+    viewer's own closing tag, and they are the only ones written here; holding
+    viewer.html to this rule would report its helpers as undefined and drown
+    the real signal.
+    """
+
+    injected = html.split("</html>", 1)[-1]
+    for index, block in enumerate(_script_blocks(injected)):
+        source = _strip_js_literals(block)
+        declared = set(re.findall(r"function\s+([A-Za-z_$][\w$]*)", source))
+        declared |= set(re.findall(r"(?:var|let|const)\s+([A-Za-z_$][\w$]*)", source))
+        declared |= set(re.findall(r"([A-Za-z_$][\w$]*)\s*=\s*function", source))
+        called = set(re.findall(r"(?<![.\w$])([A-Za-z_$][\w$]*)\s*\(", source))
+        missing = sorted(called - declared - _JS_GLOBALS - _JS_KEYWORDS)
+        if missing:
+            raise AssertionError(f"注入脚本[{index}] 调用了未定义的名字：{missing}")
 
 
 def _self_test() -> None:

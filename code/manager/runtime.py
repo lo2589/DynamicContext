@@ -29,7 +29,7 @@ from ..dataset.input_data import (
 from ..dataset.resume_context import DatasetContext
 from ..dataset.tables import DatasetTables
 from ..lifecycle.process import process
-from ..lifecycle.rules import end_functions
+from ..lifecycle.rules import end_functions, resolve_bound
 from ..patch.state_patch import ContentPatch, ContentPatchMode
 from ..provider import ParsedAnswer, build_provider_from_cfg
 from ..recall import recall as recall_registry
@@ -1691,6 +1691,12 @@ def _settings_write(runtime: "RuntimeComponents") -> Callable[[dict], dict]:
 
         current_turn = _last_turn(runtime.tables.history)
         history = copy.deepcopy(runtime.tables.history)
+        changed = {
+            element
+            for element in set(normalized) | set(runtime.tables.life_cycle)
+            if normalized.get(element) != runtime.tables.life_cycle.get(element)
+        }
+        _rederive_ranges(history, normalized, changed, current_turn)
         lifecycle: FixedTableLifecycle = manager["lifecycle.fixed"](
             history, normalized, current_turn=current_turn
         )
@@ -1714,6 +1720,69 @@ def _settings_write(runtime: "RuntimeComponents") -> Callable[[dict], dict]:
         }
 
     return write
+
+
+def _rederive_ranges(
+    history: History,
+    life_cycle: dict,
+    changed: set[str],
+    current_turn: int,
+) -> None:
+    """Recompute the intervals of every cell whose rule changed.
+
+    ``state = π(流, 声明)`` only holds if the projection actually re-reads the
+    declaration. Cells persist the interval that was in force when they were
+    written, and rebuilding from those alone would make a changed declaration
+    apply to future slots only — the old rule would live on inside the ledger,
+    which is the thing declarations exist to keep out of it.
+
+    Only elements whose declaration changed are touched. That is what keeps
+    this safe for the intervals no declaration produced: compaction retiring a
+    stretch of turns, a /cancelpin, a patch's ``remain``. Those are events, not
+    rules, and re-deriving an untouched element would erase the record of them.
+
+    Compaction is then re-applied on top for the changed elements, because a
+    summary records the span it folded (``compact_range``) — so that closure is
+    itself re-derivable from the ledger rather than being lost.
+    """
+
+    for element in changed:
+        rule = life_cycle.get(element)
+        if not isinstance(rule, (list, tuple)) or len(rule) != 2:
+            continue
+        for turn_id, content in history.items():
+            slot = content.get(element)
+            if slot is None:
+                continue
+            born = int(turn_id)
+            end = resolve_bound(rule[1], born)
+            style = (slot.get("range") or [[None, 1.0, "none"]])[0]
+            density = style[1] if len(style) > 1 else 1.0
+            compressor = style[2] if len(style) > 2 else "none"
+            slot["range"] = [[[born, end], density, compressor]]
+
+    # Re-apply what compaction folded: each summary states the span it covers.
+    for turn_id, content in history.items():
+        for name, slot in content.items():
+            if not name.endswith(SUMMARY_SUFFIX):
+                continue
+            span = slot.get(COMPACT_RANGE_KEY)
+            if not (isinstance(span, list) and len(span) == 2):
+                continue
+            retire_at = min(
+                (int(entry[0][0]) for entry in (slot.get("range") or []) if entry and entry[0]),
+                default=int(turn_id),
+            )
+            for covered in range(int(span[0]), int(span[1]) + 1):
+                covered_content = history.get(str(covered), {})
+                for element in changed:
+                    covered_slot = covered_content.get(element)
+                    if covered_slot is None:
+                        continue
+                    for entry in covered_slot.get("range") or []:
+                        end = entry[0][1]
+                        if end is None or int(end) >= retire_at:
+                            entry[0][1] = max(int(entry[0][0]), retire_at - 1)
 
 
 def _write_life_cycle_to_yaml(cfg: Any, life_cycle: dict) -> None:
