@@ -1066,6 +1066,10 @@ class RuntimeComponents:
     patch_end_template: str = ""
     # Why the last turn produced nothing, for a UI that cannot see the console.
     last_error: str | None = None
+    # Text generated so far this turn, and whether generation is still running
+    # — the browser's equivalent of watching the stream scroll in a terminal.
+    streaming: str = ""
+    streaming_active: bool = False
 
     def queue_patch(self, content_patch: ContentPatch) -> None:
         if content_patch.created_turn is None:
@@ -1716,6 +1720,10 @@ def run_runtime(runtime: RuntimeComponents) -> None:
                 model_status=_model_status(runtime),
                 model_switch=_model_switch(runtime),
                 last_error=lambda: runtime.last_error,
+                streaming=lambda: {
+                    "text": runtime.streaming,
+                    "active": runtime.streaming_active,
+                },
             )
         except Exception as exc:  # noqa: BLE001 - a busy port must never stop a run
             print(f"[viewer skipped: {exc}]")
@@ -1785,11 +1793,19 @@ def run_runtime(runtime: RuntimeComponents) -> None:
                 )
                 continue
 
-            on_chunk = (
-                (lambda chunk: print(chunk, end="", flush=True))
-                if show_stream
-                else None
-            )
+            # The terminal has always watched generation arrive chunk by
+            # chunk; the browser saw nothing at all until the turn committed,
+            # which on a local model is tens of seconds of a page that looks
+            # frozen. Same callback, one more consumer: accumulate into a
+            # buffer the page polls (GET /streaming).
+            runtime.streaming = ""
+            runtime.streaming_active = True
+
+            def on_chunk(chunk: str) -> None:
+                runtime.streaming += chunk
+                if show_stream:
+                    print(chunk, end="", flush=True)
+
             try:
                 parsed = runtime.process_turn(item, on_chunk=on_chunk)
             except Exception as exc:  # noqa: BLE001
@@ -1801,9 +1817,11 @@ def run_runtime(runtime: RuntimeComponents) -> None:
                 # killed the process, which a terminal user could see and
                 # restart — a browser user just gets a dead page instead.
                 runtime.last_error = f"{type(exc).__name__}: {exc}"
+                runtime.streaming_active = False
                 print(f"\n[turn failed, not committed] {runtime.last_error}")
                 continue
             runtime.last_error = None
+            runtime.streaming_active = False
             if show_stream:
                 print()
             else:

@@ -92,6 +92,12 @@ SEND_BAR = """
   font:inherit;font-size:12.5px;white-space:nowrap}
 #live-send button:disabled{opacity:.5;cursor:default}
 #live-send .status{color:var(--ink-2);font-size:11.5px;min-width:7em}
+/* The in-progress reply is a message, so it is rendered as one, in the
+   transcript, using the viewer's own bubble classes — .b.t for reasoning and
+   .b.a for the answer, exactly as a committed turn looks. */
+#live-provisional{display:flex;flex-direction:column;gap:9px;padding:0 14px 6px}
+#live-provisional .b{animation:livepulse 1.4s ease-in-out infinite}
+@keyframes livepulse{0%,100%{opacity:.62}50%{opacity:1}}
 #live-model{color:var(--ink-2);font-size:11px;letter-spacing:.04em;
   display:flex;gap:7px;align-items:center;flex-wrap:wrap}
 #live-model b{color:var(--ink);font-weight:600;letter-spacing:0}
@@ -109,8 +115,8 @@ SEND_BAR = """
     <div id="live-model-form">
       <select id="live-model-saved"><option value="">— 新配置 —</option></select>
       <select id="live-model-vendor"></select>
-      <input id="live-model-name" placeholder="model" autocomplete="off" list="live-model-list">
-      <datalist id="live-model-list"></datalist>
+      <select id="live-model-name"></select>
+      <input id="live-model-name-manual" placeholder="model 名字" autocomplete="off" hidden>
       <input id="live-model-url" placeholder="base_url" autocomplete="off">
       <input id="live-model-key" type="password" placeholder="api_key（本地保存）" autocomplete="off">
       <input id="live-model-saveas" placeholder="存成 xxx.json（可留空）" autocomplete="off">
@@ -134,6 +140,42 @@ SEND_BAR = """
   var input = document.getElementById("live-send-text")
   var button = document.getElementById("live-send-btn")
   var status = document.getElementById("live-send-status")
+  // Provisional bubbles live in the transcript, after it. render() rewrites
+  // #chat only when new data lands, and when it does this turn has committed
+  // — so the placeholder is replaced by the real thing at exactly the right
+  // moment, with no cleanup race.
+  var live = document.createElement("div")
+  live.id = "live-provisional"
+  if (chat && chat.parentNode) chat.parentNode.insertBefore(live, bar)
+
+  // The stream carries the model's raw markup (<think>…</think> then the
+  // answer). Split it the same way the ledger will, so what is shown while
+  // generating matches what is shown once committed.
+  function renderLive(text) {
+    if (!text) { live.innerHTML = ""; return }
+    var think = "", answer = text
+    var open = text.indexOf("<think>")
+    if (open !== -1) {
+      var close = text.indexOf("</think>")
+      if (close === -1) { think = text.slice(open + 7); answer = "" }
+      else { think = text.slice(open + 7, close); answer = text.slice(close + 8) }
+    }
+    var html = ""
+    if (think.trim()) {
+      html += '<div class="b t"><span class="tag">think · generating</span>' +
+        escapeHtml(think.trim().slice(-400)) + "</div>"
+    }
+    if (answer.trim()) {
+      html += '<div class="b a"><span class="tag">assistant · generating</span>' +
+        escapeHtml(answer.trim()) + "</div>"
+    }
+    live.innerHTML = html
+    live.scrollIntoView({ block: "end" })
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+  }
 
   function send() {
     var text = input.value.trim()
@@ -154,11 +196,41 @@ SEND_BAR = """
         // than the configured interval right after sending so it shows up
         // as soon as it commits, without dropping the steady background poll.
         var tries = 0
+        var started = Date.now()
+        var sawActive = false
+        function finish(message) {
+          clearInterval(fast)
+          status.textContent = message || ""
+          renderLive("")
+          window.__liveTick()  // make sure the committed turn is on screen
+        }
         var fast = setInterval(function () {
           tries += 1
-          if (tries > 80) { clearInterval(fast); status.textContent = "no reply"; return }
+          if (tries > 400) { finish("no reply"); return }
+          // Show generation as it arrives — the terminal has always had this
+          // via on_chunk; without it a local model looks like a frozen page
+          // for the tens of seconds it takes to answer.
+          fetch("/streaming", { cache: "no-store" })
+            .then(function (r) { return r.ok ? r.json() : null })
+            .then(function (s) {
+              if (!s) return
+              if (s.active) {
+                sawActive = true
+                var secs = Math.round((Date.now() - started) / 1000)
+                status.textContent = "generating " + secs + "s"
+                renderLive(s.text)
+              } else if (sawActive) {
+                // Generation ended. This — not the history poll — is the
+                // authoritative finish signal: the background poller runs on
+                // its own interval and may consume the history change first,
+                // in which case __liveTick() here reports "nothing new" and
+                // the placeholder would never be cleared.
+                finish("")
+              }
+            })
+            .catch(function () {})
           window.__liveTick().then(function (changed) {
-            if (changed) { clearInterval(fast); status.textContent = ""; return }
+            if (changed) { finish(""); return }
             // No new turn yet — it may simply be slow, or the turn may have
             // failed outright (bad key, unreachable model). The runtime
             // records why; without checking, a failed turn is indistinguishable
@@ -167,8 +239,7 @@ SEND_BAR = """
               .then(function (r) { return r.ok ? r.json() : null })
               .then(function (d) {
                 if (d && d.error) {
-                  clearInterval(fast)
-                  status.textContent = d.error
+                  finish(d.error)
                   // The turn was never committed, so the words are gone
                   // unless we hand them back. Only restore into an empty box
                   // — never clobber something typed while waiting.
@@ -204,9 +275,15 @@ SEND_BAR = """
   var saveAsIn = document.getElementById("live-model-saveas")
   var applyBtn = document.getElementById("live-model-apply")
   var modelStatus = document.getElementById("live-model-status")
-  var modelList = document.getElementById("live-model-list")
+  var nameManual = document.getElementById("live-model-name-manual")
   var vendors = {}
   var installed = []
+  var MANUAL = "__manual__"
+
+  // What the model field currently means, wherever it is being read from.
+  function chosenModel() {
+    return nameIn.value === MANUAL ? nameManual.value.trim() : nameIn.value
+  }
 
   function refresh() {
     return fetch("/models", { cache: "no-store" })
@@ -216,11 +293,7 @@ SEND_BAR = """
         vendors = data.vendors || {}
         installed = data.installed || []
         now.textContent = data.current.provider + " / " + data.current.model
-        // Real installed models, so the field is a pick-list rather than a
-        // guess-the-exact-tag box (an ollama tag must match exactly).
-        modelList.innerHTML = installed.map(function (m) {
-          return '<option value="' + m + '"></option>'
-        }).join("")
+        rebuildModels(data.current.model)
         if (!vendorSel.options.length) {
           Object.keys(vendors).forEach(function (v) {
             var o = document.createElement("option")
@@ -243,19 +316,39 @@ SEND_BAR = """
       .catch(function () {})
   }
 
+  // A real dropdown of what is actually installed. Ollama tags must match
+  // exactly, so typing one by hand is the error-prone path — it stays
+  // available under "手动输入…" for vendors whose catalogue we cannot list.
+  function rebuildModels(selected) {
+    var options = vendorSel.value === "ollama" ? installed.slice() : []
+    var preferred = vendors[vendorSel.value] && vendors[vendorSel.value].model
+    if (preferred && options.indexOf(preferred) === -1) options.unshift(preferred)
+    if (selected && options.indexOf(selected) === -1) options.unshift(selected)
+    nameIn.innerHTML = options.map(function (m) {
+      return '<option value="' + m + '">' + m + "</option>"
+    }).join("") + '<option value="' + MANUAL + '">手动输入…</option>'
+    nameIn.value = selected && options.indexOf(selected) !== -1 ? selected : (options[0] || MANUAL)
+    syncManual()
+  }
+
+  function syncManual() {
+    nameManual.hidden = nameIn.value !== MANUAL
+  }
+
   function fillDefaults() {
     var d = vendors[vendorSel.value] || {}
-    nameIn.value = d.model || ""
     urlIn.value = d.base_url || ""
+    rebuildModels(d.model || "")
   }
 
   toggle.onclick = function () { form.classList.toggle("open") }
   vendorSel.onchange = fillDefaults
+  nameIn.onchange = syncManual
   savedSel.onchange = function () {
     // Picking a saved config means "use this one as-is"; the manual fields
     // stop applying, so grey them out rather than pretend they still matter.
     var usingSaved = !!savedSel.value
-    ;[vendorSel, nameIn, urlIn, keyIn, saveAsIn].forEach(function (el) { el.disabled = usingSaved })
+    ;[vendorSel, nameIn, nameManual, urlIn, keyIn, saveAsIn].forEach(function (el) { el.disabled = usingSaved })
   }
 
   applyBtn.onclick = function () {
@@ -265,7 +358,7 @@ SEND_BAR = """
       ? { use_saved: savedSel.value }
       : {
           provider: vendorSel.value,
-          model: nameIn.value.trim(),
+          model: chosenModel(),
           base_url: urlIn.value.trim(),
           api_key: keyIn.value,
           save_as: saveAsIn.value.trim(),
@@ -332,6 +425,7 @@ class Handler(BaseHTTPRequestHandler):
         model_status: Callable[[], dict] | None = None,
         model_switch: Callable[[dict], dict] | None = None,
         last_error: Callable[[], str | None] | None = None,
+        streaming: Callable[[], dict] | None = None,
         **kwargs,
     ) -> None:
         self.task_dir = task_dir
@@ -342,6 +436,7 @@ class Handler(BaseHTTPRequestHandler):
         self.model_status = model_status
         self.model_switch = model_switch
         self.last_error = last_error
+        self.streaming = streaming
         super().__init__(*args, **kwargs)
 
     def _send(self, payload: bytes, mime: str, *, status: int = 200) -> None:
@@ -409,6 +504,13 @@ class Handler(BaseHTTPRequestHandler):
             # and a 503 there would read as "the send failed" rather than
             # "this page has no runtime to report errors from".
             self._send_json({"error": self.last_error() if self.last_error else None})
+        elif path == "/streaming":
+            # Partial output for the turn in flight. Always 200 for the same
+            # reason /last-error is: the page polls this constantly, and a
+            # 503 would read as a failure rather than "nothing to show".
+            self._send_json(
+                self.streaming() if self.streaming else {"text": "", "active": False}
+            )
         else:
             self.send_error(404)
 
@@ -547,6 +649,7 @@ def build_server(
     model_status: Callable[[], dict] | None = None,
     model_switch: Callable[[dict], dict] | None = None,
     last_error: Callable[[], str | None] | None = None,
+    streaming: Callable[[], dict] | None = None,
 ) -> ThreadingHTTPServer:
     if not VIEWER.is_file():
         raise SystemExit(f"{VIEWER} 不存在")
@@ -561,6 +664,7 @@ def build_server(
         model_status=model_status,
         model_switch=model_switch,
         last_error=last_error,
+        streaming=streaming,
     )
     return ThreadingHTTPServer(("127.0.0.1", port), handler)
 
@@ -580,6 +684,7 @@ def start_viewer(
     model_status: Callable[[], dict] | None = None,
     model_switch: Callable[[dict], dict] | None = None,
     last_error: Callable[[], str | None] | None = None,
+    streaming: Callable[[], dict] | None = None,
 ) -> ThreadingHTTPServer:
     """Serve the live viewer for ``task_dir`` in a background thread.
 
@@ -599,6 +704,7 @@ def start_viewer(
         model_status=model_status,
         model_switch=model_switch,
         last_error=last_error,
+        streaming=streaming,
     )
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{port}/"
