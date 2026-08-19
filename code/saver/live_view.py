@@ -53,7 +53,15 @@ POLLER = """
         if (text === null || text === last) return false
         last = text
         var turns = text.trim().split('\\n').length
-        try { load(text, label + ' · ' + turns + ' rows · live') } catch (e) {}
+        try {
+          load(text, label + ' · ' + turns + ' rows · live')
+          // load() ends on setTurn(0). For a recorded sample that is the
+          // right place to start; for a live run it means every committed
+          // turn snaps the view back to turn 0, so the reply you just asked
+          // for is written to the ledger and never shown. Follow the newest
+          // turn instead — the whole point of watching a run as it happens.
+          if (model && model.turns.length) setTurn(model.turns.length - 1)
+        } catch (e) {}
         return true
       })
       .catch(function () { return false })
@@ -65,30 +73,64 @@ POLLER = """
 </script>
 """
 
-# Appended only when a `push` callback is wired up server-side. Lives outside
-# the chat/#rows DOM that load()/render() rewrite on every tick, so it is
-# never at risk of being clobbered by a re-render.
+# Appended only when a `push` callback is wired up server-side. The composer
+# is moved into the Conversation pane (right under #chat) at load: an input
+# box belongs with the transcript it writes into, not stranded at the page
+# bottom. It is built outside the #chat element that load()/render() rewrite
+# on every tick, so a re-render never clobbers it — hence appending to the
+# pane rather than into the chat scroller.
 SEND_BAR = """
 <style>
-#live-send{position:sticky;bottom:0;display:flex;gap:8px;align-items:center;
-  padding:10px 16px;background:var(--panel);border-top:1px solid var(--rule);
-  box-shadow:var(--shadow)}
-#live-send input{flex:1;padding:8px 10px;border:1px solid var(--rule);
-  border-radius:6px;background:var(--paper);color:var(--ink);
-  font:inherit}
-#live-send button{padding:8px 14px;border:1px solid var(--rule);
+#live-send{display:flex;flex-direction:column;gap:8px;
+  padding:10px 14px;border-top:1px solid var(--rule);background:var(--panel)}
+#live-send .row{display:flex;gap:8px;align-items:center}
+#live-send input,#live-send select{padding:7px 9px;border:1px solid var(--rule);
+  border-radius:6px;background:var(--paper);color:var(--ink);font:inherit;font-size:12.5px;min-width:0}
+#live-send-text{flex:1}
+#live-send button{padding:7px 13px;border:1px solid var(--rule);
   border-radius:6px;background:var(--live);color:var(--paper);cursor:pointer;
-  font:inherit}
+  font:inherit;font-size:12.5px;white-space:nowrap}
 #live-send button:disabled{opacity:.5;cursor:default}
-#live-send .status{color:var(--ink-2);font-size:12px;min-width:8em}
+#live-send .status{color:var(--ink-2);font-size:11.5px;min-width:7em}
+#live-model{color:var(--ink-2);font-size:11px;letter-spacing:.04em;
+  display:flex;gap:7px;align-items:center;flex-wrap:wrap}
+#live-model b{color:var(--ink);font-weight:600;letter-spacing:0}
+#live-model button{background:transparent;color:var(--live);border-color:var(--rule);
+  padding:4px 9px;font-size:11px}
+#live-model-form{display:none;gap:7px;align-items:center;flex-wrap:wrap;width:100%}
+#live-model-form.open{display:flex}
+#live-model-form input{flex:1;min-width:9rem;font-size:11.5px;padding:5px 8px}
+#live-model-form select{font-size:11.5px;padding:5px 8px}
 </style>
 <div id="live-send">
-  <input id="live-send-text" type="text" placeholder="跟这个 run 说点什么…" autocomplete="off">
-  <button id="live-send-btn">Send</button>
-  <span class="status" id="live-send-status"></span>
+  <div id="live-model">
+    <span>model</span><b id="live-model-now">…</b>
+    <button id="live-model-toggle" type="button">change</button>
+    <div id="live-model-form">
+      <select id="live-model-saved"><option value="">— 新配置 —</option></select>
+      <select id="live-model-vendor"></select>
+      <input id="live-model-name" placeholder="model" autocomplete="off" list="live-model-list">
+      <datalist id="live-model-list"></datalist>
+      <input id="live-model-url" placeholder="base_url" autocomplete="off">
+      <input id="live-model-key" type="password" placeholder="api_key（本地保存）" autocomplete="off">
+      <input id="live-model-saveas" placeholder="存成 xxx.json（可留空）" autocomplete="off">
+      <button id="live-model-apply" type="button">Apply</button>
+      <span class="status" id="live-model-status"></span>
+    </div>
+  </div>
+  <div class="row">
+    <input id="live-send-text" type="text" placeholder="跟这个 run 说点什么…" autocomplete="off">
+    <button id="live-send-btn">Send</button>
+    <span class="status" id="live-send-status"></span>
+  </div>
 </div>
 <script>
 (function () {
+  var bar = document.getElementById("live-send")
+  var chat = document.getElementById("chat")
+  // Sit inside the Conversation pane, directly after the transcript.
+  if (chat && chat.parentNode) chat.parentNode.appendChild(bar)
+
   var input = document.getElementById("live-send-text")
   var button = document.getElementById("live-send-btn")
   var status = document.getElementById("live-send-status")
@@ -113,9 +155,19 @@ SEND_BAR = """
         var tries = 0
         var fast = setInterval(function () {
           tries += 1
-          if (tries > 40) { clearInterval(fast); status.textContent = ""; return }
+          if (tries > 80) { clearInterval(fast); status.textContent = "no reply"; return }
           window.__liveTick().then(function (changed) {
-            if (changed) { clearInterval(fast); status.textContent = "" }
+            if (changed) { clearInterval(fast); status.textContent = ""; return }
+            // No new turn yet — it may simply be slow, or the turn may have
+            // failed outright (bad key, unreachable model). The runtime
+            // records why; without checking, a failed turn is indistinguishable
+            // from a slow one and the box just spins forever.
+            return fetch("/last-error", { cache: "no-store" })
+              .then(function (r) { return r.ok ? r.json() : null })
+              .then(function (d) {
+                if (d && d.error) { clearInterval(fast); status.textContent = d.error }
+              })
+              .catch(function () {})
           })
         }, 750)
       })
@@ -127,6 +179,108 @@ SEND_BAR = """
   input.addEventListener("keydown", function (e) {
     if (e.key === "Enter") send()
   })
+
+  // ---- model picker ----
+  var now = document.getElementById("live-model-now")
+  var form = document.getElementById("live-model-form")
+  var toggle = document.getElementById("live-model-toggle")
+  var vendorSel = document.getElementById("live-model-vendor")
+  var savedSel = document.getElementById("live-model-saved")
+  var nameIn = document.getElementById("live-model-name")
+  var urlIn = document.getElementById("live-model-url")
+  var keyIn = document.getElementById("live-model-key")
+  var saveAsIn = document.getElementById("live-model-saveas")
+  var applyBtn = document.getElementById("live-model-apply")
+  var modelStatus = document.getElementById("live-model-status")
+  var modelList = document.getElementById("live-model-list")
+  var vendors = {}
+  var installed = []
+
+  function refresh() {
+    return fetch("/models", { cache: "no-store" })
+      .then(function (r) { return r.ok ? r.json() : null })
+      .then(function (data) {
+        if (!data) return
+        vendors = data.vendors || {}
+        installed = data.installed || []
+        now.textContent = data.current.provider + " / " + data.current.model
+        // Real installed models, so the field is a pick-list rather than a
+        // guess-the-exact-tag box (an ollama tag must match exactly).
+        modelList.innerHTML = installed.map(function (m) {
+          return '<option value="' + m + '"></option>'
+        }).join("")
+        if (!vendorSel.options.length) {
+          Object.keys(vendors).forEach(function (v) {
+            var o = document.createElement("option")
+            o.value = v; o.textContent = v
+            vendorSel.appendChild(o)
+          })
+          vendorSel.value = data.current.provider
+          fillDefaults()
+        }
+        // Rebuild the saved-config list; a just-saved file must show up.
+        var keep = savedSel.value
+        savedSel.innerHTML = '<option value="">— 新配置 —</option>'
+        ;(data.saved || []).forEach(function (f) {
+          var o = document.createElement("option")
+          o.value = f; o.textContent = f
+          savedSel.appendChild(o)
+        })
+        savedSel.value = keep
+      })
+      .catch(function () {})
+  }
+
+  function fillDefaults() {
+    var d = vendors[vendorSel.value] || {}
+    nameIn.value = d.model || ""
+    urlIn.value = d.base_url || ""
+  }
+
+  toggle.onclick = function () { form.classList.toggle("open") }
+  vendorSel.onchange = fillDefaults
+  savedSel.onchange = function () {
+    // Picking a saved config means "use this one as-is"; the manual fields
+    // stop applying, so grey them out rather than pretend they still matter.
+    var usingSaved = !!savedSel.value
+    ;[vendorSel, nameIn, urlIn, keyIn, saveAsIn].forEach(function (el) { el.disabled = usingSaved })
+  }
+
+  applyBtn.onclick = function () {
+    applyBtn.disabled = true
+    modelStatus.textContent = "switching…"
+    var body = savedSel.value
+      ? { use_saved: savedSel.value }
+      : {
+          provider: vendorSel.value,
+          model: nameIn.value.trim(),
+          base_url: urlIn.value.trim(),
+          api_key: keyIn.value,
+          save_as: saveAsIn.value.trim(),
+        }
+    fetch("/model", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    })
+      .then(function (r) { return r.json().then(function (d) { if (!r.ok) throw new Error(d.error || r.statusText); return d }) })
+      .then(function (d) {
+        keyIn.value = ""
+        return refresh().then(function () {
+          // The switch is done and the header above already shows the new
+          // model — leaving the form open with a stale "switched" label just
+          // looks stuck. Collapse it; the header is the confirmation.
+          form.classList.remove("open")
+          modelStatus.textContent = ""
+          var head = document.getElementById("live-model-now")
+          head.textContent += d.saved_to ? "  (saved)" : ""
+        })
+      })
+      .catch(function (err) { modelStatus.textContent = "failed: " + err.message })
+      .then(function () { applyBtn.disabled = false })
+  }
+
+  refresh()
 })()
 </script>
 """
@@ -140,8 +294,14 @@ def page(label: str, interval_ms: int, *, bare: bool = False, writable: bool = F
     if bare:
         html = re.sub(r"const SAMPLES = \{.*?\};?\n", "const SAMPLES = {};\n", html, count=1)
     # Drop the auto-pick so the shipped sample does not flash before the first
-    # poll lands; the poller supplies the first load.
-    html = re.sub(r'pick\("[\w-]+"\)\s*;?', "", html, count=1)
+    # poll lands; the poller supplies the first load. The real call in
+    # viewer.html is `pick(Object.keys(SAMPLES)[0]);` — bare mode empties
+    # SAMPLES, so Object.keys(SAMPLES)[0] is undefined and an unstripped call
+    # throws (TypeError: Cannot read properties of undefined) before the
+    # poller ever runs. Caught by actually loading the page in a browser
+    # (Playwright), not by the HTTP-level self-tests, which never execute
+    # the page's JS and so never saw this.
+    html = re.sub(r"pick\(Object\.keys\(SAMPLES\)\[0\]\)\s*;?", "", html, count=1)
     html += POLLER % {"label": json.dumps(label, ensure_ascii=False), "interval": interval_ms}
     if writable:
         html += SEND_BAR
@@ -157,6 +317,9 @@ class Handler(BaseHTTPRequestHandler):
         push: Callable[[str], None] | None,
         recall_preview: Callable[[str], list[str]] | None = None,
         compress_status: Callable[[], dict] | None = None,
+        model_status: Callable[[], dict] | None = None,
+        model_switch: Callable[[dict], dict] | None = None,
+        last_error: Callable[[], str | None] | None = None,
         **kwargs,
     ) -> None:
         self.task_dir = task_dir
@@ -164,6 +327,9 @@ class Handler(BaseHTTPRequestHandler):
         self.push = push
         self.recall_preview = recall_preview
         self.compress_status = compress_status
+        self.model_status = model_status
+        self.model_switch = model_switch
+        self.last_error = last_error
         super().__init__(*args, **kwargs)
 
     def _send(self, payload: bytes, mime: str, *, status: int = 200) -> None:
@@ -221,6 +387,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "此页面没有接到可写入的 runtime"}, status=503)
                 return
             self._send_json(self.compress_status())
+        elif path == "/models":
+            if self.model_status is None:
+                self._send_json({"error": "此页面没有接到可写入的 runtime"}, status=503)
+                return
+            self._send_json(self.model_status())
+        elif path == "/last-error":
+            # Always 200, even unwired: the page polls this after every send,
+            # and a 503 there would read as "the send failed" rather than
+            # "this page has no runtime to report errors from".
+            self._send_json({"error": self.last_error() if self.last_error else None})
         else:
             self.send_error(404)
 
@@ -271,6 +447,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/recall/preview":
             self._handle_recall_preview()
             return
+        if path == "/model":
+            self._handle_model_switch()
+            return
         if path not in self.CONTROL_PATHS:
             self.send_error(404)
             return
@@ -318,6 +497,27 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send_json({"results": self.recall_preview(query)})
 
+    def _handle_model_switch(self) -> None:
+        if self.model_switch is None:
+            self._send_json({"error": "此页面没有接到可写入的 runtime"}, status=503)
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            payload = json.loads(self.rfile.read(length) or b"{}")
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            self._send_json({"error": "invalid JSON body"}, status=400)
+            return
+        if not isinstance(payload, dict):
+            self._send_json({"error": "body must be a JSON object"}, status=400)
+            return
+        try:
+            self._send_json(self.model_switch(payload))
+        except (ValueError, FileNotFoundError) as exc:
+            # A rejected vendor/model/key is the caller's mistake, not a
+            # server fault — and the provider was never swapped, so the run
+            # keeps answering with whatever it had.
+            self._send_json({"error": str(exc)}, status=400)
+
     def log_message(self, *_args) -> None:
         """Silence per-request logging; the poll would drown the console."""
 
@@ -332,6 +532,9 @@ def build_server(
     push: Callable[[str], None] | None = None,
     recall_preview: Callable[[str], list[str]] | None = None,
     compress_status: Callable[[], dict] | None = None,
+    model_status: Callable[[], dict] | None = None,
+    model_switch: Callable[[dict], dict] | None = None,
+    last_error: Callable[[], str | None] | None = None,
 ) -> ThreadingHTTPServer:
     if not VIEWER.is_file():
         raise SystemExit(f"{VIEWER} 不存在")
@@ -343,6 +546,9 @@ def build_server(
         push=push,
         recall_preview=recall_preview,
         compress_status=compress_status,
+        model_status=model_status,
+        model_switch=model_switch,
+        last_error=last_error,
     )
     return ThreadingHTTPServer(("127.0.0.1", port), handler)
 
@@ -359,6 +565,9 @@ def start_viewer(
     bare: bool = True,
     recall_preview: Callable[[str], list[str]] | None = None,
     compress_status: Callable[[], dict] | None = None,
+    model_status: Callable[[], dict] | None = None,
+    model_switch: Callable[[dict], dict] | None = None,
+    last_error: Callable[[], str | None] | None = None,
 ) -> ThreadingHTTPServer:
     """Serve the live viewer for ``task_dir`` in a background thread.
 
@@ -375,6 +584,9 @@ def start_viewer(
         push=push,
         recall_preview=recall_preview,
         compress_status=compress_status,
+        model_status=model_status,
+        model_switch=model_switch,
+        last_error=last_error,
     )
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{port}/"
@@ -492,6 +704,14 @@ def _self_test() -> None:
 
         # Writable mode (runtime.viewer's use): bare page, /send reaches push.
         received: list[str] = []
+        switched: list[dict] = []
+
+        def _fake_switch(payload: dict) -> dict:
+            if payload.get("provider") == "nope":
+                raise ValueError("unsupported provider 'nope'")
+            switched.append(payload)
+            return {"ok": True, "provider": payload.get("provider"), "model": payload.get("model")}
+
         server = build_server(
             task_dir,
             label="live",
@@ -501,6 +721,12 @@ def _self_test() -> None:
             push=received.append,
             recall_preview=lambda query: [f"echo:{query}"],
             compress_status=lambda: {"enabled": True, "current_turn": 3},
+            model_status=lambda: {
+                "current": {"provider": "dry-run", "model": "dry-run"},
+                "vendors": {"dry-run": {"base_url": "", "model": "dry-run"}},
+                "saved": [],
+            },
+            model_switch=_fake_switch,
         )
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -529,6 +755,17 @@ def _self_test() -> None:
             status, reply = post("/recall/preview", {"query": "花生"})
             assert (status, reply) == (200, {"results": ["echo:花生"]})
             status, reply = post("/recall/preview", {"query": "  "})
+            assert status == 400 and "error" in reply
+
+            # Model picker: list, switch, and a rejected switch.
+            with opener.open(f"http://127.0.0.1:{port}/models") as response:
+                models = json.loads(response.read())
+            assert models["current"]["provider"] == "dry-run"
+            assert "dry-run" in models["vendors"]
+            status, reply = post("/model", {"provider": "glm", "model": "GLM-4.5-Air"})
+            assert status == 200 and reply["ok"] is True
+            assert switched[-1]["model"] == "GLM-4.5-Air"
+            status, reply = post("/model", {"provider": "nope"})
             assert status == 400 and "error" in reply
 
             status, reply = post("/send", {"text": "hello from the page"})

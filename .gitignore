@@ -23,3 +23,6 @@ task/*
 config/*
 !config/standard/
 !config/standard/**
+
+# Playwright CLI scratch output (snapshots, console logs)
+.playwright-cli/

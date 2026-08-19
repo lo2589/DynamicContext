@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -157,6 +158,22 @@ def _messages(context: Any) -> list[dict[str, str]]:
     return messages
 
 
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+# A proxy has no business intercepting a request to the machine we are already
+# on. urllib honours HTTP_PROXY for every host unless no_proxy happens to be
+# set, so a developer with a system proxy configured (Privoxy, Clash, a
+# corporate PAC) cannot reach their own Ollama at all — the request is
+# forwarded to the proxy, which cannot route back to the caller's loopback.
+_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _urlopen(request: urllib.request.Request, *, timeout: int):
+    host = urllib.parse.urlsplit(request.full_url).hostname or ""
+    if host in _LOOPBACK_HOSTS:
+        return _DIRECT_OPENER.open(request, timeout=timeout)
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
 def _request_json(
     url: str,
     body: dict[str, Any],
@@ -174,7 +191,7 @@ def _request_json(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _urlopen(request, timeout=timeout) as response:
             value = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -205,7 +222,7 @@ def _stream_response_objects(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _urlopen(request, timeout=timeout) as response:
             for raw_line in response:
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line:

@@ -1064,6 +1064,8 @@ class RuntimeComponents:
     source_patches: list[ContentPatch] = field(default_factory=list)
     patch_end_enabled: bool = False
     patch_end_template: str = ""
+    # Why the last turn produced nothing, for a UI that cannot see the console.
+    last_error: str | None = None
 
     def queue_patch(self, content_patch: ContentPatch) -> None:
         if content_patch.created_turn is None:
@@ -1401,6 +1403,141 @@ def _snapshot_tables(tables: DatasetTables, turn_id: int) -> None:
     print(f"[snapshot saved: {snapshot_dir}]")
 
 
+def _model_status(runtime: "RuntimeComponents") -> Callable[[], dict]:
+    """What model is answering right now, and what else could.
+
+    ``vendors`` is PROVIDER_DEFAULTS — the vendors the provider registry can
+    actually build, with their default model/base_url — so the page offers
+    exactly what `python3 -m code.provider init` would, no separate list to
+    keep in sync. ``saved`` is the config-provider files already on disk, so
+    a key entered once never has to be typed again.
+    """
+
+    def status() -> dict:
+        from ..provider.provider import CONFIG_DIR, PROVIDER_DEFAULTS
+
+        config = getattr(runtime.provider, "config", None)
+        saved = (
+            sorted(path.name for path in CONFIG_DIR.glob("*.json"))
+            if CONFIG_DIR.is_dir()
+            else []
+        )
+        return {
+            "current": {
+                "provider": getattr(config, "provider", ""),
+                "model": getattr(config, "model", ""),
+                "base_url": getattr(config, "base_url", ""),
+                "has_api_key": bool(getattr(config, "api_key", "")),
+            },
+            "vendors": PROVIDER_DEFAULTS,
+            "saved": saved,
+            # Which models are actually installed, so the picker offers real
+            # choices instead of one free-text box. Only Ollama can answer
+            # this without credentials, so only Ollama is enumerated; the
+            # hosted vendors keep their default as a starting point and stay
+            # type-in, since their catalogue needs a key to list.
+            "installed": _installed_ollama_models(
+                getattr(config, "base_url", "") or PROVIDER_DEFAULTS["ollama"]["base_url"]
+            ),
+        }
+
+    return status
+
+
+def _installed_ollama_models(base_url: str) -> list[str]:
+    """Ask a local Ollama what it has pulled. Best-effort: an unreachable or
+    slow daemon yields an empty list rather than blocking the page."""
+
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    from ..provider.provider import PROVIDER_DEFAULTS, _urlopen
+
+    root = (base_url or PROVIDER_DEFAULTS["ollama"]["base_url"]).rstrip("/")
+    if not root:
+        return []
+    try:
+        request = urllib.request.Request(f"{root}/api/tags", method="GET")
+        with _urlopen(request, timeout=2) as response:
+            payload = _json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError, RuntimeError):
+        return []
+    models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(models, list):
+        return []
+    return sorted(
+        str(entry.get("name"))
+        for entry in models
+        if isinstance(entry, dict) and entry.get("name")
+    )
+
+
+def _model_switch(runtime: "RuntimeComponents") -> Callable[[dict], dict]:
+    """Swap the answering model mid-session, optionally saving the config.
+
+    Only ``runtime.provider`` changes — the ledger, the life_cycle rules and
+    every committed turn stay exactly as they are, so a conversation can
+    continue across a model change rather than starting over. That attribute
+    was already swappable (runtime.py's own self-test replaces it to simulate
+    a failing provider); this just exposes it, with a real construction and a
+    key check up front so a bad switch fails here instead of mid-turn.
+
+    ``save_as`` (a bare filename) additionally persists the config into
+    config-provider/ through the same save_provider_config the CLI uses —
+    that, plus a first switch on a machine with no config at all, is what
+    makes this the first-run setup path too.
+    """
+
+    def switch(payload: dict) -> dict:
+        from ..provider.provider import (
+            PROVIDER_DEFAULTS,
+            ProviderConfig,
+            build_provider,
+            load_provider_config,
+            save_provider_config,
+        )
+
+        # Reusing a saved config: name it and nothing else is required.
+        saved_name = str(payload.get("use_saved") or "").strip()
+        if saved_name:
+            config = load_provider_config(saved_name)
+        else:
+            vendor = str(payload.get("provider") or "").strip().lower()
+            if vendor not in PROVIDER_DEFAULTS:
+                raise ValueError(
+                    f"unsupported provider {vendor!r}；可选：{', '.join(PROVIDER_DEFAULTS)}"
+                )
+            defaults = PROVIDER_DEFAULTS[vendor]
+            config = ProviderConfig.from_dict(
+                {
+                    "provider": vendor,
+                    "model": str(payload.get("model") or "").strip() or defaults["model"],
+                    "base_url": str(payload.get("base_url") or "").strip() or defaults["base_url"],
+                    "api_key": str(payload.get("api_key") or ""),
+                    "timeout": payload.get("timeout") or 300,
+                }
+            )
+
+        instance = build_provider(config)
+        runtime.provider = instance
+
+        saved_to = None
+        save_as = str(payload.get("save_as") or "").strip()
+        if save_as:
+            saved_to = str(save_provider_config(config, save_as))
+        print(f"[model switched: {config.provider} / {config.model}]")
+        return {
+            "ok": True,
+            "provider": config.provider,
+            "model": config.model,
+            "base_url": config.base_url,
+            "saved_to": saved_to,
+        }
+
+    return switch
+
+
 def _recall_preview(runtime: "RuntimeComponents") -> Callable[[str], list[str]]:
     """IF-14: recall["grep"] reads its query from a history slot, not a bare
     string (see code/recall/grep_recall.py) — so an ad-hoc preview query is
@@ -1505,6 +1642,9 @@ def run_runtime(runtime: RuntimeComponents) -> None:
                 push=viewer_push,
                 recall_preview=_recall_preview(runtime),
                 compress_status=_compress_status(runtime),
+                model_status=_model_status(runtime),
+                model_switch=_model_switch(runtime),
+                last_error=lambda: runtime.last_error,
             )
         except Exception as exc:  # noqa: BLE001 - a busy port must never stop a run
             print(f"[viewer skipped: {exc}]")
@@ -1579,7 +1719,20 @@ def run_runtime(runtime: RuntimeComponents) -> None:
                 if show_stream
                 else None
             )
-            parsed = runtime.process_turn(item, on_chunk=on_chunk)
+            try:
+                parsed = runtime.process_turn(item, on_chunk=on_chunk)
+            except Exception as exc:  # noqa: BLE001
+                # A provider that refuses (bad key, unreachable endpoint, a
+                # model switched to something that isn't running) must not
+                # take the whole session down: the turn is already guaranteed
+                # uncommitted, so the ledger is intact and the next input can
+                # be answered by a working provider. Before the web UI this
+                # killed the process, which a terminal user could see and
+                # restart — a browser user just gets a dead page instead.
+                runtime.last_error = f"{type(exc).__name__}: {exc}"
+                print(f"\n[turn failed, not committed] {runtime.last_error}")
+                continue
+            runtime.last_error = None
             if show_stream:
                 print()
             else:
