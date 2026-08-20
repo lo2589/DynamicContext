@@ -26,8 +26,11 @@
    transcript, using the viewer's own bubble classes — .b.t for reasoning and
    .b.a for the answer, exactly as a committed turn looks. */
 #live-provisional{display:flex;flex-direction:column;gap:9px}
-#live-provisional .b{animation:livepulse 1.4s ease-in-out infinite}
-@keyframes livepulse{0%,100%{opacity:.62}50%{opacity:1}}
+/* No animation here. Text being generated is text you are trying to read;
+   pulsing it made the thing you were reading move. The status line beside
+   Send already says "generating Ns", which is where a progress signal
+   belongs — next to the control, not on the content. */
+#live-provisional .b{opacity:.82}
 #live-model{color:var(--ink-2);font-size:11px;letter-spacing:.04em;
   display:flex;gap:7px;align-items:center;flex-wrap:wrap}
 #live-model b{color:var(--ink);font-weight:600;letter-spacing:0}

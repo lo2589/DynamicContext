@@ -81,30 +81,59 @@
   // moment the committed turn (which contains the real user slot) lands.
   var pendingUser = ""
 
+  // One node per bubble, created once and then only having its text updated.
+  // Rebuilding innerHTML on every poll — 750ms while generating — destroyed
+  // and recreated these nodes more than once a second, which reflowed the
+  // block and restarted any CSS animation from zero. That is what read as
+  // flashing: not a pulse, a strobe.
+  var slots = {}
+
+  function slotNode(key, className, tagText) {
+    var node = slots[key]
+    if (node === undefined) {
+      node = document.createElement("div")
+      node.className = "b " + className
+      if (tagText) {
+        var tag = document.createElement("span")
+        tag.className = "tag"
+        tag.textContent = tagText
+        node.appendChild(tag)
+      }
+      node.appendChild(document.createTextNode(""))
+      slots[key] = node
+    }
+    if (node.parentNode !== live) live.appendChild(node)
+    return node
+  }
+
+  function setSlot(key, className, tagText, text) {
+    if (!text) {
+      var existing = slots[key]
+      if (existing && existing.parentNode) existing.parentNode.removeChild(existing)
+      return
+    }
+    var node = slotNode(key, className, tagText)
+    var body = node.lastChild
+    if (body.nodeValue !== text) body.nodeValue = text
+  }
+
   function renderLive(text) {
-    if (!text && !pendingUser) { live.innerHTML = ""; return }
+    if (!text && !pendingUser) {
+      live.innerHTML = ""
+      slots = {}
+      return
+    }
     attachLive()
     var think = "", answer = text || ""
-    var open = text.indexOf("<think>")
+    var open = answer.indexOf("<think>")
     if (open !== -1) {
-      var close = text.indexOf("</think>")
-      if (close === -1) { think = text.slice(open + 7); answer = "" }
-      else { think = text.slice(open + 7, close); answer = text.slice(close + 8) }
+      var close = answer.indexOf("</think>")
+      if (close === -1) { think = answer.slice(open + 7); answer = "" }
+      else { think = answer.slice(open + 7, close); answer = answer.slice(close + 8) }
     }
-    var html = ""
-    if (pendingUser) {
-      html += '<div class="b u">' + escapeHtml(pendingUser) + "</div>"
-    }
-    if (think.trim()) {
-      html += '<div class="b t"><span class="tag">think · generating</span>' +
-        escapeHtml(think.trim().slice(-400)) + "</div>"
-    }
-    if (answer.trim()) {
-      html += '<div class="b a"><span class="tag">assistant · generating</span>' +
-        escapeHtml(answer.trim()) + "</div>"
-    }
-    attachLive()
-    live.innerHTML = html
+    setSlot("user", "u", "", pendingUser)
+    setSlot("think", "t", "think · generating", think.trim().slice(-400))
+    setSlot("answer", "a", "assistant · generating", answer.trim())
     if (chat) chat.scrollTop = chat.scrollHeight
   }
 
