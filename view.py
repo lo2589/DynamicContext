@@ -80,7 +80,24 @@ def build(page: str, jsonl: str, label: str) -> str:
     # First key wins the page's opening pick; the recorded samples stay after it
     # for comparison.
     merged = {RUN_KEY: {"label": label, "jsonl": jsonl}, **samples}
-    return page[:start] + json.dumps(merged, ensure_ascii=False) + page[end:]
+    page = page[:start] + json.dumps(merged, ensure_ascii=False) + page[end:]
+    return page + markdown_layer()
+
+
+def markdown_layer() -> str:
+    """The same Markdown renderer the served page gets, inlined.
+
+    A model answers with a table; viewer.html only escapes it, so every
+    newline collapses and the table arrives as one unreadable line. The live
+    server links these two files from /static — an exported page has no
+    server, and it is meant to survive being sent to someone else, so they go
+    in the file itself. Same sources, no second copy of the code.
+    """
+
+    web = HERE / "web"
+    css = (web / "markdown.css").read_text(encoding="utf-8")
+    js = (web / "markdown.js").read_text(encoding="utf-8")
+    return f"\n<style>{css}</style>\n<script>\n{js}\n</script>\n"
 
 
 def main() -> None:

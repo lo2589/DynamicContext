@@ -108,6 +108,13 @@ def page(label: str, interval_ms: int, *, bare: bool = False, writable: bool = F
         ensure_ascii=False,
     )
     html += f'\n<script>window.__live = {settings};</script>\n'
+    # Markdown first, and in read-only mode too: what the model wrote is a
+    # table or a list whether or not this page can talk back, and viewer.html
+    # only escapes it — which collapses every newline and turns a table into
+    # one unreadable line. markdown.js wraps render(); it must be in place
+    # before live.js polls and draws.
+    html += f"<style>{(WEB_DIR / 'markdown.css').read_text(encoding='utf-8')}</style>\n"
+    html += '<script src="/static/markdown.js"></script>\n'
     if writable:
         html += f"<style>{(WEB_DIR / 'live.css').read_text(encoding='utf-8')}</style>\n"
         html += (WEB_DIR / "live.html").read_text(encoding="utf-8")
@@ -120,7 +127,12 @@ class Handler(BaseHTTPRequestHandler):
         self,
         *args,
         task_dir: Path,
-        body: bytes,
+        # bytes, or something that produces them per request. Building the
+        # page once and holding it meant an edit to web/ was invisible until
+        # the session was restarted — and restarting a session to see a CSS
+        # change is exactly the coupling web/ exists to remove. multi_host
+        # already builds it per request; this makes the two agree.
+        body: bytes | Callable[[], bytes],
         push: Callable[[str], None] | None,
         recall_preview: Callable[[str], list[str]] | None = None,
         compress_status: Callable[[], dict] | None = None,
@@ -176,7 +188,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 — BaseHTTPRequestHandler's spelling
         path = self.path.split("?", 1)[0]
         if path in ("/", "/index.html"):
-            self._send(self.body, "text/html; charset=utf-8")
+            body = self.body() if callable(self.body) else self.body
+            self._send(body, "text/html; charset=utf-8")
         elif path.startswith("/static/"):
             serve_static(self, path)
         elif path == "/history.jsonl":
@@ -513,7 +526,7 @@ def build_server(
     handler = partial(
         Handler,
         task_dir=task_dir,
-        body=page(label, interval_ms, bare=bare, writable=push is not None),
+        body=partial(page, label, interval_ms, bare=bare, writable=push is not None),
         push=push,
         recall_preview=recall_preview,
         compress_status=compress_status,
@@ -615,6 +628,35 @@ def _assert_js_parses(_html: str = "") -> None:
             if result.returncode != 0:
                 raise AssertionError(f"{source.name} 不是合法 JS：{result.stderr.strip()[:200]}")
         _assert_no_undefined_calls(source.name, text)
+    if node:
+        _assert_markdown_renders(node)
+
+
+# markdown.js is the one front-end file that is a pure function of its input,
+# so it is the one that can actually be tested rather than only parsed: it
+# exports mdToHtml on `this` when there is no window, which makes it a plain
+# CommonJS module under node.
+_MARKDOWN_PROBE = """
+const md = require(process.argv[1]).mdToHtml;
+const table = md("| a | b |\\n|---|---|\\n| 1 | 2 |");
+if (!/<table>.*<td>1<\\/td>/s.test(table)) throw new Error("表格没渲染出来: " + table);
+const para = md("first\\nsecond");
+if (!para.includes("<br>")) throw new Error("换行被吃了: " + para);
+if (md("<img src=x onerror=alert(1)>").includes("<img")) throw new Error("没转义");
+if (!md('{"a":1}').includes("md-json")) throw new Error("JSON 没排版");
+"""
+
+
+def _assert_markdown_renders(node: str) -> None:
+    import subprocess as _subprocess
+
+    result = _subprocess.run(
+        [node, "-e", _MARKDOWN_PROBE, str(WEB_DIR / "markdown.js")],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise AssertionError(f"markdown.js 渲染不对：{result.stderr.strip()[:300]}")
 
 
 # Names the injected scripts may use without declaring them: browser builtins,

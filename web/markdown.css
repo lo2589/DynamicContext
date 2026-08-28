@@ -1,0 +1,36 @@
+/* markdown.js 渲染出来的东西怎么排版。跟着渲染器一起放，别掺进 live.css。
+   颜色全部走 rgba 灰：气泡有绿底白字（user）也有浅底深字（assistant），
+   同一套边框要在两种底色上都看得见。 */
+.md{overflow-wrap:anywhere}
+.md > :first-child{margin-top:0}
+.md > :last-child{margin-bottom:0}
+.md p{margin:.42em 0}
+.md h1,.md h2,.md h3,.md h4,.md h5,.md h6{
+  margin:.75em 0 .35em;font-weight:600;line-height:1.35;font-size:12.5px}
+.md h1{font-size:14px}
+.md h2{font-size:13.5px}
+.md h3{font-size:13px}
+.md ul,.md ol{margin:.4em 0;padding-left:1.35em}
+.md li{margin:.16em 0}
+.md li > ul,.md li > ol{margin:.16em 0}
+.md code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.92em;
+  background:rgba(127,127,127,.18);padding:.1em .32em;border-radius:4px}
+.md pre.md-pre{margin:.5em 0;padding:8px 10px;border-radius:7px;
+  background:rgba(127,127,127,.14);overflow-x:auto}
+.md pre.md-pre code{background:none;padding:0;font-size:11.5px;line-height:1.5}
+.md blockquote{margin:.5em 0;padding:.1em 0 .1em .7em;
+  border-left:2px solid rgba(127,127,127,.45);opacity:.86}
+.md hr.md-hr{border:0;border-top:1px solid rgba(127,127,127,.4);margin:.65em 0}
+.md a{color:inherit;text-decoration:underline;text-underline-offset:2px}
+.md strong{font-weight:600}
+
+/* 表格：宽了就自己横向滚，不许把整页顶宽。 */
+.md-table-wrap{margin:.5em 0;max-width:100%;overflow-x:auto}
+.md table{border-collapse:collapse;font-size:11.5px;line-height:1.45}
+.md th,.md td{border:1px solid rgba(127,127,127,.42);padding:4px 8px;
+  text-align:left;vertical-align:top}
+.md thead th{background:rgba(127,127,127,.16);font-weight:600;white-space:nowrap}
+
+/* 82% 是聊天气泡的宽度。一条九列的表按 82% 挤，每列都只剩两个字。 */
+.b.has-table{max-width:97%}
+.compact-block.has-table{max-width:100%}
