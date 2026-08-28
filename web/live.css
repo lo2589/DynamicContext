@@ -93,3 +93,83 @@
 .turn-ops button.kill:hover{border-color:var(--mark);color:var(--mark)}
 .turn-ops button:disabled{opacity:.4;cursor:default}
 .turn-ops .said{color:var(--ink-2);font-size:9.5px;margin-left:2px}
+
+/* ---- one screen, no page scrollbar ----
+   The page was an ordinary document: title, timetable, legend, stats, then
+   the two panes stacked below. With .chat and .ctx fixed at 440px that runs
+   well past the fold, so the composer — the reason this page is open — could
+   only be reached by scrolling down to it first. Every time.
+
+   So the workbench gets the viewport and nothing more: the timetable takes a
+   capped slice at the top, the panes take the rest, each scrolls inside
+   itself, and the composer is always where you left it. The browser's own
+   scrollbar goes away, which also means the mouse wheel over a pane always
+   means that pane rather than sometimes the whole document.
+
+   Only here, never in viewer.html: live.css is injected for writable pages
+   only, so a page exported by view.py stays a document you can scroll. */
+html, body { height: 100% }
+body { overflow: hidden }
+
+.wrap { height: 100%; display: flex; flex-direction: column;
+        padding-top: 12px; padding-bottom: 12px; box-sizing: border-box }
+h1, .bar, .legend, .stats { flex: 0 0 auto }
+
+/* The grid yields, the conversation does not. On a 720px-tall screen a fixed
+   vh slice left the transcript 105px — about one message — so the grid is
+   allowed to shrink instead — but only to about six rows, not to a sliver,
+   because a grid you cannot read is not worth the space it still costs.
+   Both keep a floor; whoever wants the rest scrolls inside either one. */
+.gridbox { flex: 0 1 auto; min-height: 196px; display: flex; flex-direction: column }
+.gridhead { flex: 0 0 auto }
+
+/* The essay explaining what this page is belongs on a page someone was handed,
+   not on the one they are working in — it is taller than the conversation and
+   was pushing it off the screen. Same reasoning that hid .drop. */
+.note { display: none }
+
+/* Capped rather than sized, and capped low: the grid is reference material,
+   the conversation is the work. Everything above the panes is squeezed for
+   the same reason — at the original spacing the transcript came out about
+   190px tall, which is two messages. */
+.gridscroll { flex: 1 1 auto; min-height: 0; max-height: 17vh; overflow: auto }
+.bar { margin-bottom: 10px }
+.gridbox { margin-top: 10px }
+.legend { margin-top: 7px }
+.stats { margin-top: 9px; gap: 20px }
+
+.panes { flex: 1 1 auto; min-height: 300px; margin-top: 11px }
+/* min-height:0 on both, or a flex/grid child refuses to shrink below its
+   content and overflows the screen instead of scrolling inside itself. */
+.pane { display: flex; flex-direction: column; min-height: 0 }
+.pane > h2 { flex: 0 0 auto }
+.chat, .ctx { flex: 1 1 auto; min-height: 0; max-height: none }
+#live-send { flex: 0 0 auto }
+#live-settings-panel { flex: 0 0 auto; max-height: 40vh; overflow: auto }
+
+/* Narrow enough that the panes stack, and one screen stops being possible —
+   hand the page back its scrollbar. */
+@media (max-width: 880px) {
+  body { overflow: auto }
+  .wrap { height: auto }
+  .chat, .ctx { max-height: 52vh }
+  .gridscroll { max-height: none }
+}
+
+/* On a short screen everything cannot fit, so what gives way is reference,
+   never the work. The legend is a thing you read once; the stats are a thing
+   you glance at; the composer is the reason the page is open. Ordered by how
+   little you lose. */
+@media (max-height: 870px) {
+  .legend { display: none }
+  .gridbox { min-height: 168px }
+}
+@media (max-height: 790px) {
+  .stats { display: none }
+  .gridbox { min-height: 132px }
+  .panes { min-height: 240px }
+}
+@media (max-height: 680px) {
+  .gridbox { min-height: 106px }
+  .panes { min-height: 200px }
+}
