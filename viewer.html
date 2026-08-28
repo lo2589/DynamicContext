@@ -349,16 +349,34 @@ const chatNodes = new Map();
 function cellKey(c){ return c.t + "\u0000" + c.e; }
 function markKey(turn){ return "turn\u0000" + turn; }
 
+/* Scrolling does one job here: putting you back. If you have scrolled away
+   to read something earlier and then say something new, the pane returns to
+   the live end of the conversation — that is the whole rule. It does not
+   align anything, does not chase the newest reply, and does not follow the
+   stream: an answer grows downward from where the pane already is, so
+   nothing needs to move while it is written. Draws never scroll either; a
+   committed turn changes no pixel the reader can see. live.js calls this
+   when you send, and render() calls it once when the page opens. */
+function resetChatToLatest(){
+  const chat = $("chat");
+  if (!chat) return;
+  // Three frames, because markdown.js paints the bubbles after render()
+  // returns and fonts settle after that: a height read now is provisional.
+  chat.scrollTop = chat.scrollHeight;
+  requestAnimationFrame(function(){
+    chat.scrollTop = chat.scrollHeight;
+    requestAnimationFrame(function(){ chat.scrollTop = chat.scrollHeight; });
+  });
+}
+
+let openedAtNewest = false;
+
 function render(){
   // The transcript is reconciled below rather than redrawn, so its offset
   // survives on its own and nothing has to be put back. The context pane and
   // the timetable are still replaced wholesale, and a replaced innerHTML
   // drops scrollTop/scrollLeft to zero — read theirs before, restore after.
-  // The transcript's one remaining need is to follow the newest slot for a
-  // reader already at the bottom; measured now, while it is still empty on
-  // first draw, which is what opens a run on its latest turn.
   const chat = $("chat"), ctxPane = $("ctx"), grid = document.querySelector(".gridscroll");
-  const chatFollows = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 40;
   const ctxTop = ctxPane ? ctxPane.scrollTop : 0;
   const gridLeft = grid ? grid.scrollLeft : 0;
   $("turnno").textContent = t;
@@ -424,16 +442,11 @@ function render(){
 
   if (ctxPane) ctxPane.scrollTop = ctxTop;
   if (grid) grid.scrollLeft = gridLeft;
-  if (chatFollows){
-    // Following the newest slot cannot be done in this frame alone: appended
-    // bubbles keep growing after they land — markdown rendered into them,
-    // fonts settling — so scrollHeight read here is stale and the pane stops
-    // short. Pin once now so nothing visibly jumps, again once layout settles.
-    chat.scrollTop = chat.scrollHeight;
-    requestAnimationFrame(function(){
-      chat.scrollTop = chat.scrollHeight;
-      requestAnimationFrame(function(){ chat.scrollTop = chat.scrollHeight; });
-    });
+  // Once, on open. After this, where the reader is standing is the reader's
+  // business until they send something.
+  if (!openedAtNewest && past.length){
+    openedAtNewest = true;
+    requestAnimationFrame(resetChatToLatest);
   }
 }
 

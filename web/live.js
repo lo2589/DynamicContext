@@ -11,18 +11,6 @@
       .then(function (text) {
         if (text === null || text === last) return false
         last = text
-        // load() replaces the transcript's innerHTML, so scrollTop drops to the
-        // top: the moment a turn committed, the pane jumped back to the start
-        // of the conversation — exactly when the reply you waited for arrived.
-        // Stay where the reader is: pinned to the newest turn if they were
-        // already at the bottom, otherwise back to the offset they chose.
-        var chat = document.getElementById('chat')
-        var pinned = true
-        var previousTop = 0
-        if (chat) {
-          previousTop = chat.scrollTop
-          pinned = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 40
-        }
         var turns = text.trim().split('\n').length
         try {
           load(text, label + ' · ' + turns + ' rows · live')
@@ -33,7 +21,10 @@
           // turn instead — the whole point of watching a run as it happens.
           if (model && model.turns.length) setTurn(model.turns.length - 1)
         } catch (e) {}
-        if (chat) chat.scrollTop = pinned ? chat.scrollHeight : previousTop
+        // No scroll handling here on purpose: render() reconciles the
+        // transcript rather than replacing it, so the offset is never lost,
+        // and following the newest turn is tracked there from the reader's
+        // own scrolling. A second opinion from this side only ever fought it.
         return true
       })
       .catch(function () { return false })
@@ -131,9 +122,6 @@
   }
 
   function renderLive(text) {
-    // Read before touching the bubbles: once their text changes the pane has
-    // already grown, and every poll would then look like "not at the bottom".
-    var chatPinned = chat ? chat.scrollHeight - chat.scrollTop - chat.clientHeight < 40 : true
     if (!text && !pendingUser) {
       live.innerHTML = ""
       slots = {}
@@ -150,10 +138,10 @@
     setSlot("user", "u", "", pendingUser)
     setSlot("think", "t", "think · generating", think.trim().slice(-400))
     setSlot("answer", "a", "assistant · generating", answer.trim())
-    // Follow the stream only for a reader who is already at the bottom;
-    // scrolling back through the transcript mid-generation used to be
-    // impossible, every chunk yanked the pane down again.
-    if (chat && chatPinned) chat.scrollTop = chat.scrollHeight
+    // Deliberately does not scroll. The reply grows downward from where it
+    // was already put on screen when you sent; dragging the pane on every
+    // chunk is what made reading back through the transcript mid-generation
+    // impossible.
   }
 
   function escapeHtml(s) {
@@ -176,6 +164,10 @@
         input.value = ""
         pendingUser = sent
         renderLive("")
+        // The one scroll in the whole page: you said something, so come back
+        // to the live end of the conversation. Wherever you had wandered off
+        // to reading, this is the moment to return.
+        if (window.resetChatToLatest) window.resetChatToLatest()
         status.textContent = "waiting for reply…"
         // The turn only lands once the model finishes; poll a bit faster
         // than the configured interval right after sending so it shows up
@@ -190,6 +182,9 @@
           stopBtn.hidden = true
           renderLive("")
           window.__liveTick()  // make sure the committed turn is on screen
+          // No scrolling here on purpose. You did not ask for anything at
+          // this moment — the provisional bubbles just became permanent ones
+          // in the same place. Moving the pane now is the jump.
         }
         var fast = setInterval(function () {
           tries += 1
