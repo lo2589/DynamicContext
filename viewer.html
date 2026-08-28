@@ -450,7 +450,15 @@ function render(){
   }
 }
 
-function load(text, label){
+/* startTurn is "last" for a run being watched, and left out for a recording,
+   which opens at the beginning. It exists because landing on turn 0 first and
+   then jumping to the end is not the same as going straight there: render()
+   reconciles against the turn it is given, so a stop at turn 0 removes every
+   bubble past it and the jump back builds them all again. That is a full
+   rebuild taking the scenic route — the nodes are replaced, the per-turn
+   controls go with them, and every draw pays for a reconcile it then throws
+   away. One draw, at the turn actually wanted. */
+function load(text, label, startTurn){
   let m;
   try { m = parse(text); }
   catch (err){ $("src").textContent = "Could not read it — " + err.message; $("src").className = "src bad"; return; }
@@ -459,7 +467,7 @@ function load(text, label){
   $("src").textContent = label + " — " + m.turns.length + " turns · " + m.cells.length
     + " slots · " + m.kinds.length + " kinds";
   $("scrub").max = m.turns.length - 1;
-  setTurn(0);
+  setTurn(startTurn === "last" ? m.turns.length - 1 : (startTurn || 0));
 }
 
 function setTurn(i){

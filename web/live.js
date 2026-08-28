@@ -13,13 +13,12 @@
         last = text
         var turns = text.trim().split('\n').length
         try {
-          load(text, label + ' · ' + turns + ' rows · live')
-          // load() ends on setTurn(0). For a recorded sample that is the
-          // right place to start; for a live run it means every committed
-          // turn snaps the view back to turn 0, so the reply you just asked
-          // for is written to the ledger and never shown. Follow the newest
-          // turn instead — the whole point of watching a run as it happens.
-          if (model && model.turns.length) setTurn(model.turns.length - 1)
+          // Straight to the newest turn. Loading at turn 0 and then jumping
+          // was the same view in the end and not the same work: render()
+          // reconciles against whatever turn it is handed, so the stop at 0
+          // removed every bubble after it and the jump rebuilt them — a full
+          // rebuild in two steps, taking the per-turn controls with it.
+          load(text, label + ' · ' + turns + ' rows · live', 'last')
         } catch (e) {}
         // No scroll handling here on purpose: render() reconciles the
         // transcript rather than replacing it, so the offset is never lost,
@@ -47,7 +46,7 @@
   var input = document.getElementById("live-send-text")
   var button = document.getElementById("live-send-btn")
   var status = document.getElementById("live-send-status")
-  // Provisional bubbles live in the transcript, after it. render() rewrites
+  // Provisional bubbles live in the transcript, after it. render() reconciles
   // #chat only when new data lands, and when it does this turn has committed
   // — so the placeholder is replaced by the real thing at exactly the right
   // moment, with no cleanup race.
@@ -65,7 +64,7 @@
   // Provisional bubbles go inside the transcript, as its last children.
   // Sitting outside it put the message you just sent in a separate block
   // below the conversation — which is where "my input showed up at the
-  // bottom" came from. render() rewrites #chat wholesale, so re-attach on
+  // bottom" came from. render() may re-order #chat's children, so re-attach on
   // every draw rather than placing it once.
   var live = document.createElement("div")
   live.id = "live-provisional"
