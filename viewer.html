@@ -516,7 +516,11 @@ $("prev").onclick   = function(){ stop(); setTurn(model.turns.indexOf(t) - 1); }
 $("next").onclick   = function(){ stop(); setTurn(model.turns.indexOf(t) + 1); };
 $("scrub").oninput  = function(e){ stop(); setTurn(+e.target.value); };
 addEventListener("keydown", function(e){
-  if (e.target.tagName === "INPUT") return;
+  // 守卫必须覆盖所有可输入控件，不只是 INPUT：输入框是 TEXTAREA，在里面按
+  // 方向键（移动光标、中文输入法选字）本会漏到下面，被当成"切换轮次"，
+  // 每按一下整页重绘一轮——就是"输入时滚轴乱跳"的来源。下拉框同理。
+  const tag = e.target.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || e.target.isContentEditable) return;
   if (e.key === "ArrowLeft"){ stop(); setTurn(model.turns.indexOf(t) - 1); }
   if (e.key === "ArrowRight"){ stop(); setTurn(model.turns.indexOf(t) + 1); }
 });

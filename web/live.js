@@ -23,13 +23,15 @@
           // this turn's bubbles that the streaming view never showed, so the
           // sentence resetChatToLatest lined up with the bottom ends up
           // pushed out of a short pane the moment the turn lands. Correct for
-          // it once — but only if you are still sitting where that reset left
-          // you; if you scrolled off in the meantime, catching up now would
-          // be the exact jump this file exists to not do.
+          // it once — when the pane has been sticking to the bottom since the
+          // send, or is still sitting exactly where that reset left it. If you
+          // scrolled off in the meantime, catching up now would be the exact
+          // jump this file exists to not do.
           if (window.__awaitingOwnReply) {
             var chat = document.getElementById('chat')
+            var nearPin = chat && Math.abs(chat.scrollTop - (window.__lastChatReset || 0)) < 8
             if (chat && window.resetChatToLatest &&
-                Math.abs(chat.scrollTop - (window.__lastChatReset || 0)) < 8) {
+                ((window.__liveStick && window.__liveStick()) || nearPin)) {
               window.resetChatToLatest()
             }
             window.__awaitingOwnReply = false
@@ -89,6 +91,21 @@
     if (chat && live.parentNode !== chat) chat.appendChild(live)
   }
   attachLive()
+
+  // 贴底跟随。原来的滚动是两次离散的钉底：发送时一次（resetChatToLatest），
+  // 落账时再一次（tick 里的 turnmark 校正）——两次之间内容高度被流式气泡、
+  // turnmark、markdown 重绘改过，第二次钉底就是肉眼可见的"跳走"。改成从
+  // 发送那一刻起持续贴底：回复在你眼前往下长，没有任何一跳。你主动上滚
+  // 就脱钩（sticking=false），回到"不打扰"；滚回底部即恢复。程序性钉底
+  // 也会触发 scroll 事件，所以状态只由"是否贴底"决定，不分辨来源。
+  var sticking = false
+  if (chat) {
+    chat.addEventListener("scroll", function () {
+      sticking = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 24
+    })
+  }
+  // tick() 在另一个 IIFE 里，落账校正要读这个状态，走 window。
+  window.__liveStick = function () { return sticking }
 
   // The stream carries the model's raw markup (<think>…</think> then the
   // answer). Split it the same way the ledger will, so what is shown while
@@ -153,10 +170,9 @@
     setSlot("user", "u", "", pendingUser)
     setSlot("think", "t", "think · generating", think.trim().slice(-400))
     setSlot("answer", "a", "assistant · generating", answer.trim())
-    // Deliberately does not scroll. The reply grows downward from where it
-    // was already put on screen when you sent; dragging the pane on every
-    // chunk is what made reading back through the transcript mid-generation
-    // impossible.
+    // 贴底时跟着长：回复往下延伸、底部始终钉住，是连续滚动而不是跳。
+    // 没贴底（你上滚去读别的）就一个字都不动——读历史不被打扰的约定不变。
+    if (sticking && chat) chat.scrollTop = chat.scrollHeight
   }
 
   function escapeHtml(s) {
@@ -183,6 +199,9 @@
         // back to the live end of the conversation. Once, here, and nowhere
         // else — chat2 does the same thing in one line right after it appends.
         if (window.resetChatToLatest) window.resetChatToLatest()
+        // 从这一刻起贴底，直到你主动上滚：流式增长和落账校正都读这个状态，
+        // 原来"发送钉一次、落账再钉一次"的两次跳变成一次连续跟随。
+        sticking = true
         // On window, not a local var: tick() lives in the page's other,
         // unconditional IIFE (it also runs on a read-only served page, where
         // this composer never exists at all) and needs to read this without

@@ -77,19 +77,10 @@
 .b.t.open,.b.a.open{max-height:none}
 .b.t.open::after,.b.a.open::after{content:"收起"}
 
-/* Compact is an axis on the answer bubble too, not just reasoning. A single
-   reply measured at 452px against a 267px pane — over three screens on its
-   own — and no scroll fix changes that: "stick to bottom" can only ever show
-   the tail of whatever is tallest, so a bubble this size pushes your own
-   sentence out no matter how the pane is anchored. Same cure as .b.t: collapse
-   by default, expand on click. 11em rather than 6.2em, since an answer is the
-   thing you asked for and reasoning is not — most replies fit under it
-   whole, and the ones that do not are exactly the ones worth collapsing. */
-.b.a{max-height:11em;flex-shrink:0;overflow:hidden;cursor:pointer;
-  position:relative;padding-bottom:15px}
-.b.a::after{content:"展开";position:absolute;right:9px;bottom:2px;
-  font-size:9px;letter-spacing:.06em;color:var(--live);
-  background:var(--panel);padding:0 4px;border-radius:4px}
+/* 回答气泡默认完整展开（用户明确要求）：不再 11em 折叠。长回复靠面板自身
+   滚动阅读，发送后贴底跟随会把它带到底部。think 气泡仍折叠。 */
+.b.a{position:relative}
+.b.a::after{content:none}
 
 /* Per-turn controls, injected into the transcript's turn markers. A turn can
    be taken out of the model's view without touching what it says, or killed
