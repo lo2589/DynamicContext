@@ -306,38 +306,61 @@ function renderGrid(){
   $("g-note").textContent = model.kinds.length + " kinds · " + shown.length + " columns";
 }
 
+/* A record's text never changes once written. What changes as you move
+   through turns is only whether it is still in context — which is a class and
+   one line on its tag, nothing more. Keeping that wording in one place is
+   what lets a bubble be updated where it stands instead of rebuilt. */
+function tagText(c, live){
+  if (c.k === "summary")
+    return "compaction · summary of everything up to turn " + c.t
+      + (live ? "" : " · retired, a later summary replaced it");
+  return c.e + (live ? "" : " · retired");
+}
+
 function bubble(c, live){
   if (c.k === "summary")
     return '<div class="compact-block' + (live ? "" : " fade") + '">'
-      + '<span class="ctag">compaction · summary of everything up to turn ' + c.t
-      + (live ? "" : " · retired, a later summary replaced it") + '</span>'
+      + '<span class="ctag">' + esc(tagText(c, live)) + '</span>'
       + (esc(c.c) || "<i>(empty)</i>") + '</div>';
 
   const cls = c.e === "user" ? "u" : c.e === "assistant" ? "a" : c.e === "think" ? "t" : "sys";
   const tag = (cls === "sys" || cls === "t")
-    ? '<span class="tag">' + esc(c.e) + (live ? "" : " · retired") + '</span>' : "";
+    ? '<span class="tag">' + esc(tagText(c, live)) + '</span>' : "";
   return '<div class="b ' + cls + (live ? "" : " fade") + '">' + tag
     + (esc(c.c) || "<i>(empty)</i>") + '</div>';
 }
 
+function nodeFrom(html){
+  const holder = document.createElement("div");
+  holder.innerHTML = html;
+  return holder.firstElementChild;
+}
+
+function setBubbleLive(node, c, live){
+  node.classList.toggle("fade", !live);
+  const tag = node.querySelector(".tag") || node.querySelector(".ctag");
+  if (tag) tag.textContent = tagText(c, live);
+}
+
+/* Every bubble and turn marker, by a key that outlives a draw. An element
+   name is unique inside its turn — they are the keys of one JSON object — so
+   turn plus element identifies a record for good. */
+const chatNodes = new Map();
+function cellKey(c){ return c.t + "\u0000" + c.e; }
+function markKey(turn){ return "turn\u0000" + turn; }
+
 function render(){
-  // Every pane below is rebuilt by replacing innerHTML, and a replaced
-  // innerHTML drops scrollTop/scrollLeft to zero: on each committed turn and
-  // each scrub, the transcript jumped to the top, the context pane went with
-  // it, and the timetable snapped back to its first column. Read the offsets
-  // before rebuilding, put them back after. The transcript is the single
-  // exception — if it was already at the bottom, follow the newest slot
-  // rather than freeze in place. Reading before the rebuild is also what
-  // makes the first render behave: the pane is still empty, so it counts as
-  // at-the-bottom and the run opens on its latest turn.
-  const panes = [$("chat"), $("ctx"), document.querySelector(".gridscroll")]
-    .filter(Boolean)
-    .map(el => ({
-      el: el,
-      top: el.scrollTop,
-      left: el.scrollLeft,
-      follow: el === $("chat") && el.scrollHeight - el.scrollTop - el.clientHeight < 40,
-    }));
+  // The transcript is reconciled below rather than redrawn, so its offset
+  // survives on its own and nothing has to be put back. The context pane and
+  // the timetable are still replaced wholesale, and a replaced innerHTML
+  // drops scrollTop/scrollLeft to zero — read theirs before, restore after.
+  // The transcript's one remaining need is to follow the newest slot for a
+  // reader already at the bottom; measured now, while it is still empty on
+  // first draw, which is what opens a run on its latest turn.
+  const chat = $("chat"), ctxPane = $("ctx"), grid = document.querySelector(".gridscroll");
+  const chatFollows = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 40;
+  const ctxTop = ctxPane ? ctxPane.scrollTop : 0;
+  const gridLeft = grid ? grid.scrollLeft : 0;
   $("turnno").textContent = t;
   $("scrub").value = model.turns.indexOf(t);
   renderGrid();
@@ -345,12 +368,44 @@ function render(){
   const past = model.cells.filter(function(c){ return c.t <= t; });
   const live = past.filter(function(c){ return visibleAt(c.r, t); });
 
-  let html = "", last = null;
+  /* Redrawing the whole transcript was never necessary and was charged for
+     twice: the scroll offset had to be saved and restored around every draw,
+     and anything attached to a bubble — live.js's per-turn controls — had to
+     be re-injected after each one. history.jsonl is append-only, so both
+     additions and removals happen at the end; everything in between only
+     needs its visibility refreshed. */
+  const wanted = [];
+  let last = null;
   past.forEach(function(c){
-    if (c.t !== last){ html += '<div class="turnmark">turn ' + c.t + '</div>'; last = c.t; }
-    html += bubble(c, visibleAt(c.r, t));
+    if (c.t !== last){ wanted.push({ key: markKey(c.t), turn: c.t }); last = c.t; }
+    wanted.push({ key: cellKey(c), cell: c });
   });
-  $("chat").innerHTML = html;
+
+  const want = new Set(wanted.map(function(w){ return w.key; }));
+  Array.from(chatNodes.keys()).forEach(function(key){
+    if (want.has(key)) return;
+    const gone = chatNodes.get(key);
+    if (gone && gone.parentNode) gone.parentNode.removeChild(gone);
+    chatNodes.delete(key);
+  });
+
+  // Walking a cursor keeps order right without touching nodes already in
+  // place. The cursor ends on whatever live.js appended for the turn being
+  // generated, so a newly committed turn lands in front of it, not after.
+  let cursor = chat.firstChild;
+  wanted.forEach(function(w){
+    let node = chatNodes.get(w.key);
+    if (!node){
+      node = nodeFrom(w.cell
+        ? bubble(w.cell, visibleAt(w.cell.r, t))
+        : '<div class="turnmark">turn ' + w.turn + '</div>');
+      chatNodes.set(w.key, node);
+    } else if (w.cell){
+      setBubbleLive(node, w.cell, visibleAt(w.cell.r, t));
+    }
+    if (node === cursor) cursor = node.nextSibling;
+    else chat.insertBefore(node, cursor);
+  });
   $("h-count").textContent = past.length + " slots · "
     + past.filter(function(c){ return c.e === "user"; }).length + " exchanges";
 
@@ -367,20 +422,19 @@ function render(){
   $("s-gone").textContent  = past.length - live.length;
   $("s-ratio").textContent = past.length ? Math.round(live.length / past.length * 100) + "%" : "0%";
 
-  panes.forEach(p => {
-    p.el.scrollLeft = p.left;
-    if (!p.follow){ p.el.scrollTop = p.top; return; }
-    // Following the newest slot cannot be done in this frame alone: the
-    // bubbles keep growing after innerHTML lands — markdown rendered into
-    // them, fonts settling — so scrollHeight read here is stale and the pane
-    // stops short of the bottom. Pin once now so there is no visible jump,
-    // then again once layout has caught up.
-    p.el.scrollTop = p.el.scrollHeight;
-    requestAnimationFrame(() => {
-      p.el.scrollTop = p.el.scrollHeight;
-      requestAnimationFrame(() => { p.el.scrollTop = p.el.scrollHeight; });
+  if (ctxPane) ctxPane.scrollTop = ctxTop;
+  if (grid) grid.scrollLeft = gridLeft;
+  if (chatFollows){
+    // Following the newest slot cannot be done in this frame alone: appended
+    // bubbles keep growing after they land — markdown rendered into them,
+    // fonts settling — so scrollHeight read here is stale and the pane stops
+    // short. Pin once now so nothing visibly jumps, again once layout settles.
+    chat.scrollTop = chat.scrollHeight;
+    requestAnimationFrame(function(){
+      chat.scrollTop = chat.scrollHeight;
+      requestAnimationFrame(function(){ chat.scrollTop = chat.scrollHeight; });
     });
-  });
+  }
 }
 
 function load(text, label){

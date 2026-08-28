@@ -596,9 +596,12 @@
 
 // ---- per-turn visibility: hide / restore / kill ----
 // The viewer renders the transcript as "turn N" markers followed by that
-// turn's bubbles, and rewrites #chat wholesale on every draw. So the controls
-// are re-injected after each draw rather than placed once — an observer, not
-// a one-time pass — which also means viewer.html itself needs no change.
+// turn's bubbles. render() now reconciles those nodes instead of rewriting
+// #chat, so a marker that has already been decorated stays decorated and the
+// observer only ever has new markers to deal with — the guard in decorate()
+// went from being what made re-injection survivable to a plain skip. An
+// observer is still the right shape: markers arrive when a turn commits,
+// which is not a moment this file is told about. viewer.html needs no change.
 ;(function () {
   if (!window.__live.writable) return
 
@@ -681,8 +684,9 @@
 })()
 
 // ---- reasoning opens on click ----
-// Delegated on #chat because render() replaces its children wholesale; a
-// listener bound to each bubble would be gone on the next draw.
+// Delegated on #chat rather than bound per bubble: bubbles are appended as
+// turns commit, and a delegated listener covers the ones that do not exist
+// yet without this file having to hear about them.
 ;(function () {
   if (!window.__live.writable) return
   var chat = document.getElementById("chat")
