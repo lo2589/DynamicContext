@@ -321,6 +321,23 @@ function bubble(c, live){
 }
 
 function render(){
+  // Every pane below is rebuilt by replacing innerHTML, and a replaced
+  // innerHTML drops scrollTop/scrollLeft to zero: on each committed turn and
+  // each scrub, the transcript jumped to the top, the context pane went with
+  // it, and the timetable snapped back to its first column. Read the offsets
+  // before rebuilding, put them back after. The transcript is the single
+  // exception — if it was already at the bottom, follow the newest slot
+  // rather than freeze in place. Reading before the rebuild is also what
+  // makes the first render behave: the pane is still empty, so it counts as
+  // at-the-bottom and the run opens on its latest turn.
+  const panes = [$("chat"), $("ctx"), document.querySelector(".gridscroll")]
+    .filter(Boolean)
+    .map(el => ({
+      el: el,
+      top: el.scrollTop,
+      left: el.scrollLeft,
+      follow: el === $("chat") && el.scrollHeight - el.scrollTop - el.clientHeight < 40,
+    }));
   $("turnno").textContent = t;
   $("scrub").value = model.turns.indexOf(t);
   renderGrid();
@@ -336,7 +353,6 @@ function render(){
   $("chat").innerHTML = html;
   $("h-count").textContent = past.length + " slots · "
     + past.filter(function(c){ return c.e === "user"; }).length + " exchanges";
-  $("chat").scrollTop = $("chat").scrollHeight;
 
   $("c-count").textContent = live.length;
   $("ctx").innerHTML = live.map(function(c){
@@ -350,6 +366,11 @@ function render(){
   $("s-live").textContent  = live.length;
   $("s-gone").textContent  = past.length - live.length;
   $("s-ratio").textContent = past.length ? Math.round(live.length / past.length * 100) + "%" : "0%";
+
+  panes.forEach(p => {
+    p.el.scrollTop = p.follow ? p.el.scrollHeight : p.top;
+    p.el.scrollLeft = p.left;
+  });
 }
 
 function load(text, label){

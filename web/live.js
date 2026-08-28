@@ -11,7 +11,19 @@
       .then(function (text) {
         if (text === null || text === last) return false
         last = text
-        var turns = text.trim().split('\\n').length
+        // load() replaces the transcript's innerHTML, so scrollTop drops to the
+        // top: the moment a turn committed, the pane jumped back to the start
+        // of the conversation — exactly when the reply you waited for arrived.
+        // Stay where the reader is: pinned to the newest turn if they were
+        // already at the bottom, otherwise back to the offset they chose.
+        var chat = document.getElementById('chat')
+        var pinned = true
+        var previousTop = 0
+        if (chat) {
+          previousTop = chat.scrollTop
+          pinned = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 40
+        }
+        var turns = text.trim().split('\n').length
         try {
           load(text, label + ' · ' + turns + ' rows · live')
           // load() ends on setTurn(0). For a recorded sample that is the
@@ -21,6 +33,7 @@
           // turn instead — the whole point of watching a run as it happens.
           if (model && model.turns.length) setTurn(model.turns.length - 1)
         } catch (e) {}
+        if (chat) chat.scrollTop = pinned ? chat.scrollHeight : previousTop
         return true
       })
       .catch(function () { return false })
@@ -118,6 +131,9 @@
   }
 
   function renderLive(text) {
+    // Read before touching the bubbles: once their text changes the pane has
+    // already grown, and every poll would then look like "not at the bottom".
+    var chatPinned = chat ? chat.scrollHeight - chat.scrollTop - chat.clientHeight < 40 : true
     if (!text && !pendingUser) {
       live.innerHTML = ""
       slots = {}
@@ -134,7 +150,10 @@
     setSlot("user", "u", "", pendingUser)
     setSlot("think", "t", "think · generating", think.trim().slice(-400))
     setSlot("answer", "a", "assistant · generating", answer.trim())
-    if (chat) chat.scrollTop = chat.scrollHeight
+    // Follow the stream only for a reader who is already at the bottom;
+    // scrolling back through the transcript mid-generation used to be
+    // impossible, every chunk yanked the pane down again.
+    if (chat && chatPinned) chat.scrollTop = chat.scrollHeight
   }
 
   function escapeHtml(s) {
