@@ -19,11 +19,27 @@
           // removed every bubble after it and the jump rebuilt them — a full
           // rebuild in two steps, taking the per-turn controls with it.
           load(text, label + ' · ' + turns + ' rows · live', 'last')
+          // Measured on a live send: reconcile inserts a 32px turnmark above
+          // this turn's bubbles that the streaming view never showed, so the
+          // sentence resetChatToLatest lined up with the bottom ends up
+          // pushed out of a short pane the moment the turn lands. Correct for
+          // it once — but only if you are still sitting where that reset left
+          // you; if you scrolled off in the meantime, catching up now would
+          // be the exact jump this file exists to not do.
+          if (window.__awaitingOwnReply) {
+            var chat = document.getElementById('chat')
+            if (chat && window.resetChatToLatest &&
+                Math.abs(chat.scrollTop - (window.__lastChatReset || 0)) < 8) {
+              window.resetChatToLatest()
+            }
+            window.__awaitingOwnReply = false
+          }
         } catch (e) {}
-        // No scroll handling here on purpose: render() reconciles the
+        // No scroll handling here on purpose. render() reconciles the
         // transcript rather than replacing it, so the offset is never lost,
-        // and following the newest turn is tracked there from the reader's
-        // own scrolling. A second opinion from this side only ever fought it.
+        // and a committed turn is not a moment anyone asked for anything —
+        // the provisional bubbles just became permanent ones in the same
+        // place. Moving the pane here is the jump.
         return true
       })
       .catch(function () { return false })
@@ -163,10 +179,15 @@
         input.value = ""
         pendingUser = sent
         renderLive("")
-        // The one scroll in the whole page: you said something, so come back
-        // to the live end of the conversation. Wherever you had wandered off
-        // to reading, this is the moment to return.
+        // The one deliberate scroll in the page: you said something, so come
+        // back to the live end of the conversation. Once, here, and nowhere
+        // else — chat2 does the same thing in one line right after it appends.
         if (window.resetChatToLatest) window.resetChatToLatest()
+        // On window, not a local var: tick() lives in the page's other,
+        // unconditional IIFE (it also runs on a read-only served page, where
+        // this composer never exists at all) and needs to read this without
+        // sharing a closure with it.
+        window.__awaitingOwnReply = true
         status.textContent = "waiting for reply…"
         // The turn only lands once the model finishes; poll a bit faster
         // than the configured interval right after sending so it shows up
@@ -677,7 +698,7 @@
   new MutationObserver(decorate).observe(chat, { childList: true })
 })()
 
-// ---- reasoning opens on click ----
+// ---- reasoning and answer bubbles open on click ----
 // Delegated on #chat rather than bound per bubble: bubbles are appended as
 // turns commit, and a delegated listener covers the ones that do not exist
 // yet without this file having to hear about them.
@@ -686,7 +707,7 @@
   var chat = document.getElementById("chat")
   if (!chat) return
   chat.addEventListener("click", function (event) {
-    var bubble = event.target.closest ? event.target.closest(".b.t") : null
+    var bubble = event.target.closest ? event.target.closest(".b.t, .b.a") : null
     if (bubble && chat.contains(bubble)) bubble.classList.toggle("open")
   })
 })()

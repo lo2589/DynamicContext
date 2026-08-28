@@ -360,13 +360,34 @@ function markKey(turn){ return "turn\u0000" + turn; }
 function resetChatToLatest(){
   const chat = $("chat");
   if (!chat) return;
-  // Three frames, because markdown.js paints the bubbles after render()
-  // returns and fonts settle after that: a height read now is provisional.
-  chat.scrollTop = chat.scrollHeight;
-  requestAnimationFrame(function(){
-    chat.scrollTop = chat.scrollHeight;
-    requestAnimationFrame(function(){ chat.scrollTop = chat.scrollHeight; });
-  });
+  // scrollTop = scrollHeight is the standard bottom-pin idiom: the browser
+  // clamps the assignment to the real max (scrollHeight - clientHeight), so
+  // this lands at the bottom without computing that max by hand. But it means
+  // the clamped RESULT, not scrollHeight itself, is what has to be remembered
+  // — storing scrollHeight instead made every later comparison against it
+  // off by exactly clientHeight, so the "did the reader move" check below
+  // always looked like they had.
+  const pin = function(){ chat.scrollTop = chat.scrollHeight; window.__lastChatReset = chat.scrollTop; };
+  pin();
+  requestAnimationFrame(pin);
+  // One more frame on, because the bubble was inserted a moment ago and the
+  // layout may not have settled around it yet. That is the whole thing.
+  //
+  // Earlier versions counted frames and then watched for mutations, both of
+  // them fighting markdown.js, which repaints the bubbles after render()
+  // returns and changes their height. But this moment has no repaint to fight:
+  // the provisional bubble is plain text that live.js just created, and its
+  // height is final immediately. The reply grows underneath afterwards and
+  // pushes what you said upward — which is correct. You are looking at your
+  // own sentence, not at the newest character.
+  //
+  // What it does NOT account for is the turnmark: measured on a live send,
+  // the committed turn inserts a 32px divider above the reconciled bubbles
+  // that the streaming view never showed, pushing your own sentence down and
+  // out of a short pane. window.__lastChatReset remembers where this call
+  // left the pane, so live.js can tell, once that turn commits, whether you
+  // are still sitting where this put you or you moved off to read something
+  // else — and only correct for the divider in the first case.
 }
 
 let openedAtNewest = false;
