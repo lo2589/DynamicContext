@@ -372,14 +372,24 @@ def serve_host(
     *, port: int = HOST_PORT, tasks: list[str] | None = None, open_browser: bool = True
 ) -> tuple[ThreadingHTTPServer, Host]:
     host = Host()
+    # One unreadable config should not cost you the other conversations: a task
+    # that fails to open is reported and skipped, while opening one by name
+    # through the HTTP handler still raises, because there the caller asked for
+    # that task specifically and needs to see why it did not come up.
+    failed: list[tuple[str, str]] = []
     for task in tasks or []:
-        host.open(task)
+        try:
+            host.open(task)
+        except Exception as exc:
+            failed.append((task, str(exc).strip().splitlines()[0]))
 
     handler = type("BoundHostHandler", (HostHandler,), {"host": host})
     server = ThreadingHTTPServer(("127.0.0.1", port), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{port}/"
     print(f"[host] {len(host.sessions)} 个会话 → {url}")
+    for task, reason in failed:
+        print(f"[host] 跳过 {task}：{reason}")
     if open_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     return server, host
