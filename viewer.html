@@ -108,7 +108,7 @@ th.col.sumcol{color:var(--live);font-weight:600;font-size:9.5px;letter-spacing:.
   color:var(--ink-2);font-weight:500;border-bottom:1px solid var(--rule);
   display:flex;justify-content:space-between;align-items:baseline;gap:10px}
 .pane h2 .n{letter-spacing:0;text-transform:none;font-size:12px}
-.chat{overflow-y:auto;max-height:440px;padding:14px;display:flex;flex-direction:column;gap:9px}
+.chat{overflow-y:auto;overflow-anchor:none;max-height:440px;padding:14px;display:flex;flex-direction:column;gap:9px}
 .turnmark{align-self:center;font-size:9.5px;letter-spacing:.12em;text-transform:uppercase;
   color:var(--ink-2);padding:2px 9px;border:1px solid var(--rule);border-radius:99px}
 .b{max-width:82%;padding:7px 11px;border-radius:13px;font-size:12.5px;line-height:1.5;
@@ -128,7 +128,7 @@ th.col.sumcol{color:var(--live);font-weight:600;font-size:9.5px;letter-spacing:.
 .compact-block.fade{opacity:.42}
 .ctag{display:block;font-size:9px;letter-spacing:.09em;text-transform:uppercase;color:var(--live);
   font-weight:600;margin-bottom:4px;font-family:ui-monospace,monospace}
-.ctx{overflow-y:auto;max-height:440px;padding:12px 14px;display:flex;flex-direction:column;gap:7px}
+.ctx{overflow-y:auto;overflow-anchor:none;max-height:440px;padding:12px 14px;display:flex;flex-direction:column;gap:7px}
 .cmsg{border-left:2px solid var(--live);padding:3px 0 3px 10px;font-size:12px;overflow-wrap:anywhere}
 .cmsg .who{display:block;font-size:9.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-2);margin-bottom:2px}
 .stats{display:flex;gap:24px;flex-wrap:wrap;margin-top:14px;font-size:11px;color:var(--ink-2)}
@@ -368,8 +368,18 @@ function render(){
   $("s-ratio").textContent = past.length ? Math.round(live.length / past.length * 100) + "%" : "0%";
 
   panes.forEach(p => {
-    p.el.scrollTop = p.follow ? p.el.scrollHeight : p.top;
     p.el.scrollLeft = p.left;
+    if (!p.follow){ p.el.scrollTop = p.top; return; }
+    // Following the newest slot cannot be done in this frame alone: the
+    // bubbles keep growing after innerHTML lands — markdown rendered into
+    // them, fonts settling — so scrollHeight read here is stale and the pane
+    // stops short of the bottom. Pin once now so there is no visible jump,
+    // then again once layout has caught up.
+    p.el.scrollTop = p.el.scrollHeight;
+    requestAnimationFrame(() => {
+      p.el.scrollTop = p.el.scrollHeight;
+      requestAnimationFrame(() => { p.el.scrollTop = p.el.scrollHeight; });
+    });
   });
 }
 
