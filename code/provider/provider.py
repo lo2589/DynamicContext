@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -508,3 +509,82 @@ def no_tools(*_args: Any, **_kwargs: Any) -> None:
 @provider_registry("search.none")
 def no_search(*_args: Any, **_kwargs: Any) -> None:
     return None
+
+
+def _write_provider_to_yaml(cfg: Any, *, vendor: str, config_name: str) -> str:
+    """Point the task YAML's ``provider`` block at the newly chosen model.
+
+    This project's rule (README: "终端输入会先写回实验 yaml……运行期间只有
+    一份生效配置") is that anything which changes configuration lands in the
+    YAML, not only in memory — otherwise the file on disk quietly disagrees
+    with what is running, and a restart silently reverts the change. A model
+    picked in the browser is exactly such a change, so it is written back the
+    same way terminal overrides and ContentPatches already are
+    (_append_terminal_input, patch["yaml.write"]).
+
+    Only the two scalars under ``provider:`` are rewritten, in place —
+    comments, anchors and every other block keep their exact text, which a
+    parse-and-redump would destroy.
+    """
+
+    path = Path(cfg.source_path)
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    inside = False
+    wrote_type = wrote_config = False
+    for line in lines:
+        stripped = line.strip()
+        if not inside:
+            if re.match(r"^provider\s*:\s*$", line.rstrip("\n")):
+                inside = True
+            out.append(line)
+            continue
+        # The block ends at the first line that is neither indented nor blank.
+        if stripped and not line[:1].isspace():
+            if not wrote_type:
+                out.append(f"  type: {vendor}\n")
+            if not wrote_config:
+                out.append(f"  config: {config_name}\n")
+            inside = False
+            out.append(line)
+            continue
+        if re.match(r"^\s+type\s*:", line):
+            out.append(f"  type: {vendor}\n")
+            wrote_type = True
+            continue
+        if re.match(r"^\s+config\s*:", line):
+            out.append(f"  config: {config_name}\n")
+            wrote_config = True
+            continue
+        out.append(line)
+    if inside:  # provider block ran to end of file
+        if not wrote_type:
+            out.append(f"  type: {vendor}\n")
+        if not wrote_config:
+            out.append(f"  config: {config_name}\n")
+    path.write_text("".join(out), encoding="utf-8")
+    return str(path)
+
+
+def _installed_ollama_models(base_url: str) -> list[str]:
+    """Ask a local Ollama what it has pulled. Best-effort: an unreachable or
+    slow daemon yields an empty list rather than blocking the page."""
+
+    root = (base_url or PROVIDER_DEFAULTS["ollama"]["base_url"]).rstrip("/")
+    if not root:
+        return []
+    try:
+        request = urllib.request.Request(f"{root}/api/tags", method="GET")
+        with _urlopen(request, timeout=2) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError, RuntimeError):
+        return []
+    models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(models, list):
+        return []
+    return sorted(
+        str(entry.get("name"))
+        for entry in models
+        if isinstance(entry, dict) and entry.get("name")
+    )

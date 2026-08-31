@@ -12,10 +12,21 @@ from typing import Any, Callable
 from .context import select_context_without_extra_filter
 from .engine import FixedTableLifecycle
 from ..compact import DEFAULT_RETENTION, retain_latest_only
+from ..compact.pipeline import (
+    COMPACT_RANGE_KEY,
+    SUMMARY_SUFFIX,
+    _active_summary_anchors,
+    _all_summary_anchors,
+    _compact_enabled,
+    _compact_settings,
+    _first_uncompressed_turn,
+    _last_summary_turn,
+    _maybe_compress,
+    _retention_settings,
+)
 from ..compact.processor import (
     ProcessorRuntime,
     context_byte_size,
-    is_due_manual,
     is_due_overload,
     is_due_periodic,
 )
@@ -32,9 +43,32 @@ from ..dataset.tables import DatasetTables
 from ..lifecycle.process import process
 from ..lifecycle.rules import end_functions, resolve_bound
 from ..lifecycle.span import INF
+from ..patch.config import (
+    _commit_patch_only_turn,
+    _configured_patches,
+    _patch_end_settings,
+    _range_active_at,
+    _range_end,
+    _restore_committed_patches,
+    _source_owns_occurrence,
+)
 from ..patch.state_patch import ContentPatch, ContentPatchMode
 from ..provider import ParsedAnswer, build_provider_from_cfg
+from ..pin import (
+    PIN_ELEMENT_PATTERN,
+    _cancel_pin,
+    _create_pin,
+    _find_pin_element,
+    _next_pin_id,
+    _pin_element_name,
+)
 from ..recall import recall as recall_registry
+from ..recall.settings import (
+    RECALL_ELEMENT,
+    _recall_search_fields,
+    _recall_trigger_settings,
+    _require_recall_life_cycle,
+)
 from ..registry import (
     compact,
     dataset,
@@ -52,11 +86,6 @@ from ..saver import session_registry as _session_registry  # Register session.*/
 History = dict[str, dict[str, dict[str, Any]]]
 State = dict[str, dict[str, int]]
 Context = list[dict[str, str]]
-SUMMARY_SUFFIX = "_summary"
-# Recorded on the summary slot: the span of turns it compacted. Written
-# rather than inferred, because the interval on a record says when a slot
-# is visible, never what it replaced.
-COMPACT_RANGE_KEY = "compact_range"
 # Fallback only — the real answer is always compact.fields in YAML (read by
 # _compact_settings). Which elements compaction may fold is data, not a
 # code constant; a config that adds new elements (e.g. pin) declares its own
@@ -65,15 +94,6 @@ COMPACT_RANGE_KEY = "compact_range"
 # not a name-based branch — it is that channel's identity — but nothing else
 # in the runtime may assume it.
 INPUT_ELEMENT = "user"
-DEFAULT_RECALL_TRIGGER = "always"
-
-# pin_{origin}_{id} — origin (model/user) and id are both visible straight in
-# the element name, the same way role is visible in "user"/"assistant"
-# without a separate metadata table. Ids never repeat and are never
-# recycled after a /cancelpin: they're derived from the highest id ever
-# seen in history, not a remembered counter — same self-healing reasoning
-# as the compaction gap fix (see _first_uncompressed_turn).
-PIN_ELEMENT_PATTERN = re.compile(r"^pin_(?:model|user)_p(\d+)$")
 
 # The recall channel's own slot name — one slot per turn holding everything
 # that turn pulled back. A single fixed name (rather than recall_1..recall_n)
@@ -81,33 +101,6 @@ PIN_ELEMENT_PATTERN = re.compile(r"^pin_(?:model|user)_p(\d+)$")
 # long recalled evidence stays visible is a YAML decision: [born, born] for
 # evidence that serves only the turn that asked for it, [born, null] to make
 # it stick.
-RECALL_ELEMENT = "recall"
-
-
-def _next_pin_id(history: History) -> str:
-    numbers = [
-        int(match.group(1))
-        for content in history.values()
-        for element in content
-        if (match := PIN_ELEMENT_PATTERN.match(element))
-    ]
-    return f"p{(max(numbers) + 1) if numbers else 1:02d}"
-
-
-def _pin_element_name(origin: str, pin_id: str) -> str:
-    return f"pin_{origin}_{pin_id}"
-
-
-def _find_pin_element(history: History, pin_id: str) -> tuple[str, int] | None:
-    """Locate the (element_name, born_turn) for a bare id like "p01" —
-    /cancelpin doesn't know (or need to know) which origin created it."""
-
-    for turn_id, content in history.items():
-        for element in content:
-            match = PIN_ELEMENT_PATTERN.match(element)
-            if match and f"p{int(match.group(1)):02d}" == pin_id:
-                return element, int(turn_id)
-    return None
 
 
 def _last_turn(history: History) -> int:
@@ -208,464 +201,6 @@ def _last_turn(history: History) -> int:
 #     state.setdefault(turn_id, {})[content_patch.element] = 1
 
 
-def _configured_patches(cfg: Any) -> list[ContentPatch]:
-    values = ((cfg.to_dict().get("context") or {}).get("patches") or {})
-    if not isinstance(values, dict):
-        raise ValueError("context.patches必须是mapping")
-    patches: list[ContentPatch] = []
-    for patch_id, value in values.items():
-        if not isinstance(value, dict):
-            raise ValueError(f"context.patches.{patch_id}必须是mapping")
-        turns = value["turns"]
-        patches.append(
-            patch["create"](
-                creator=value.get("creator", "user"),
-                element=value["element"],
-                content=value["content"],
-                mode=value["mode"],
-                turns=INF if turns == "none" else turns,
-                created_turn=value["created_turn"],
-            )
-        )
-    return sorted(patches, key=lambda item: int(item.created_turn or 0))
-
-
-def _patch_end_settings(cfg: Any) -> tuple[bool, str]:
-    """Read the optional ending-message switch without making it mandatory."""
-
-    context = (cfg.to_dict().get("context") or {})
-    if not isinstance(context, dict):
-        return False, ""
-    raw = context.get("patch_end", False)
-    if isinstance(raw, bool):
-        if raw:
-            raise ValueError(
-                "context.patch_end 为 true 时必须写成 mapping 并声明 template"
-            )
-        return False, ""
-    if not isinstance(raw, dict):
-        raise ValueError("context.patch_end必须是bool或mapping")
-    enabled = raw.get("enabled", True)
-    if not isinstance(enabled, bool):
-        raise ValueError("context.patch_end.enabled必须是bool")
-    template = raw.get("template")
-    if not enabled:
-        return False, str(template or "")
-    if not isinstance(template, str) or not template.strip():
-        raise ValueError(
-            "启用 context.patch_end 时必须声明 template：结束语是内容，属于配置"
-        )
-    try:
-        template.format(element="goal", content="example")
-    except (KeyError, ValueError) as exc:
-        raise ValueError(
-            "context.patch_end.template只支持{element}和{content}"
-        ) from exc
-    return enabled, template.strip()
-
-
-def _range_end(slot: dict[str, Any]) -> int | None:
-    ends: list[int] = []
-    for entry in slot.get("range") or []:
-        try:
-            end = entry[0][1]
-        except (IndexError, TypeError):
-            continue
-        if end is None:
-            return None
-        ends.append(int(end))
-    return max(ends) if ends else None
-
-
-def _range_active_at(slot: dict[str, Any], turn: int) -> bool:
-    for entry in slot.get("range") or []:
-        try:
-            start, end = entry[0]
-        except (IndexError, TypeError, ValueError):
-            continue
-        if int(start) <= turn and (end is None or int(end) >= turn):
-            return True
-    return False
-
-
-def _source_owns_occurrence(source: ContentPatch, turn: int) -> bool:
-    if source.created_turn is None:
-        return False
-    if source.mode in (ContentPatchMode.REMAIN, ContentPatchMode.REFRESH):
-        return turn == source.created_turn
-    return source.created_turn <= turn < source.created_turn + source.turns
-
-
-def _compact_enabled(cfg: Any) -> bool:
-    """``compact: none`` (or an absent section) turns the whole mechanism off,
-    the same convention chat.tools/chat.search/recall.type already use."""
-
-    return isinstance(cfg.to_dict().get("compact"), dict)
-
-
-def _compact_settings(cfg: Any) -> tuple[int, str, int, int, tuple[str, ...]]:
-    """Read compact.* once; every field falls back if the section is absent."""
-
-    compact_cfg = cfg.to_dict().get("compact")
-    compact_cfg = compact_cfg if isinstance(compact_cfg, dict) else {}
-    overload_threshold = int(compact_cfg.get("overload_threshold_bytes") or 32000)
-    compressors = compact_cfg.get("compressors")
-    compressors = compressors if isinstance(compressors, dict) else {}
-    summary_cfg = compressors.get("summary")
-    summary_cfg = summary_cfg if isinstance(summary_cfg, dict) else {}
-    prompt = summary_cfg.get("prompt")
-    if not prompt:
-        raise ValueError(
-            "启用 compact 时必须声明 compact.compressors.summary.prompt："
-            "提示词是内容，属于配置，不由通用代码代写"
-        )
-    periodic = summary_cfg.get("periodic")
-    periodic = periodic if isinstance(periodic, dict) else {}
-    interval_turns = int(periodic.get("interval_turns") or 20)
-    keep_recent_turns = int(periodic.get("keep_recent_turns") or 10)
-    raw_fields = compact_cfg.get("fields")
-    if not isinstance(raw_fields, list) or not raw_fields:
-        raise ValueError(
-            "启用 compact 时必须声明 compact.fields："
-            "哪些元素可被折叠是配置，通用代码不预设槽位名"
-        )
-    fields = tuple(str(item) for item in raw_fields)
-    return overload_threshold, prompt, interval_turns, keep_recent_turns, fields
-
-
-def _last_summary_turn(history: History) -> int | None:
-    turns = [
-        int(turn_id)
-        for turn_id, content in history.items()
-        if any(element.endswith(SUMMARY_SUFFIX) for element in content)
-    ]
-    return max(turns) if turns else None
-
-
-def _summary_element_name(anchor_turn: int) -> str:
-    """The summary anchored at end_turn replaces that turn's own position —
-    same naming convention as the reference Processor's derived column_id
-    (f"{end_turn}_{name}"), just placed at an existing turn key instead of a
-    synthetic new one. No new number ever enters the sequence."""
-    return f"{anchor_turn}{SUMMARY_SUFFIX}"
-
-
-def _first_uncompressed_turn(
-    history: History, state: State, end_turn: int, fields: tuple[str, ...]
-) -> int | None:
-    """Smallest turn <= end_turn still carrying an active raw slot.
-
-    Deliberately not "the turn after the last summary was written" — that
-    turn number is current_turn at write time, not the end_turn the previous
-    window actually covered, and the two differ by keep_recent_turns. Reading
-    real activity out of state instead of trusting a turn-number formula also
-    means a prior gap (a bug, a crash mid-run, anything) self-heals on the
-    very next compression instead of staying skipped forever.
-    """
-    candidates = [
-        int(turn_id)
-        for turn_id, content in history.items()
-        if int(turn_id) <= end_turn
-        and any(
-            element in content and state.get(turn_id, {}).get(element) == 1
-            for element in fields
-        )
-    ]
-    return min(candidates) if candidates else None
-
-
-def _window_transcript(
-    history: History, window: tuple[int, ...], fields: tuple[str, ...]
-) -> str:
-    """Render a window of raw turns into plain text for the prompt.
-
-    Raw turns only: summaries are never fed back in, so a summary always
-    describes original exchanges rather than other summaries. Which elements
-    appear is compact.fields — the same declaration that says what may be
-    folded, so a config can never fold something the summarizer never saw.
-    """
-
-    lines: list[str] = []
-    for entry in window:
-        content = history.get(str(entry), {})
-        for element in fields:
-            slot = content.get(element)
-            if slot and slot.get("content"):
-                lines.append(f"[第{entry}轮 {element}] {slot['content']}")
-    return "\n".join(lines)
-
-
-def _all_summary_anchors(history: History) -> list[int]:
-    """Every summary ever written, visible or not, oldest first.
-
-    A summary is computed once, at the compaction turn that produced it, and
-    then kept in history forever. Retention never recomputes one — it only
-    decides which of these already-written summaries are visible for the
-    coming stretch, so the whole set is always the candidate pool.
-    """
-
-    return sorted(
-        int(turn_id)
-        for turn_id, content in history.items()
-        for element in content
-        if element == _summary_element_name(int(turn_id))
-    )
-
-
-def _active_summary_anchors(history: History, state: State) -> list[int]:
-    """Every summary visible right now, oldest first."""
-
-    return sorted(
-        int(turn_id)
-        for turn_id, content in history.items()
-        for element in content
-        if element == _summary_element_name(int(turn_id))
-        and state.get(turn_id, {}).get(element) == 1
-    )
-
-
-def _retention_settings(cfg: Any) -> tuple[str, dict[str, Any]]:
-    """Read compact.compressors.summary.retention; default keeps only the
-    newest summary, which is what compaction did before this was a choice."""
-
-    compact_cfg = cfg.to_dict().get("compact")
-    compact_cfg = compact_cfg if isinstance(compact_cfg, dict) else {}
-    compressors = compact_cfg.get("compressors")
-    compressors = compressors if isinstance(compressors, dict) else {}
-    summary_cfg = compressors.get("summary")
-    summary_cfg = summary_cfg if isinstance(summary_cfg, dict) else {}
-    retention = summary_cfg.get("retention")
-    if isinstance(retention, str):
-        return retention, {}
-    if not isinstance(retention, dict):
-        return DEFAULT_RETENTION, {}
-    name = str(retention.get("type") or DEFAULT_RETENTION)
-    params = {
-        key: value for key, value in retention.items() if key != "type"
-    }
-    return name, params
-
-
-def _apply_summary_result(
-    lifecycle: FixedTableLifecycle,
-    *,
-    anchor_turn: int,
-    retire_turn: int,
-    summary_text: str,
-    window: tuple[int, ...],
-    fields: tuple[str, ...],
-    retire_anchors: tuple[int, ...] = (),
-    reopen_anchors: tuple[int, ...] = (),
-    covered_turns: tuple[int, ...] = (),
-) -> None:
-    """Insert the summary at the position it replaces and retire every source
-    cell — always through add_slot/end_cell, which keep the persisted history
-    in sync (unlike the reference Engine's add_derived_column, which only
-    touches its own internal tables and would leave the real history/context
-    blind to it).
-
-    anchor_turn is where the summary lives (end_turn — an existing turn, so
-    no new number enters the sequence). retire_turn is when the retirement
-    takes effect (current_turn — when this compression decision was made).
-    retire_anchors are summaries the retention strategy dropped for the
-    coming stretch; reopen_anchors are ones it picked back up. Neither is
-    recomputed — retiring closes a range segment, reopening appends a new
-    one, and the content written at that anchor's own compaction turn stands
-    unchanged the whole time.
-    """
-
-    # Two facts about a summary, kept apart on purpose:
-    #   where it sits   — anchor_turn, the last turn it stands for
-    #   when it speaks  — retire_turn, the turn the compaction actually ran
-    # and one fact recorded outright rather than left to be inferred:
-    #   compact_range   — the span of turns this summary compacted, reaching
-    #                     back through any earlier summary it supersedes
-    covered_from = min(covered_turns) if covered_turns else anchor_turn
-    for old_anchor in retire_anchors:
-        old = lifecycle.history.get(str(old_anchor), {}).get(
-            _summary_element_name(old_anchor)
-        ) or {}
-        span = old.get(COMPACT_RANGE_KEY)
-        if isinstance(span, list) and span:
-            covered_from = min(covered_from, int(span[0]))
-    lifecycle.add_slot(
-        _summary_element_name(anchor_turn),
-        summary_text,
-        turn=anchor_turn,
-        visible_from=retire_turn,
-        extra={COMPACT_RANGE_KEY: [covered_from, anchor_turn]},
-    )
-    for old_anchor in retire_anchors:
-        lifecycle.end_cell(
-            _summary_element_name(old_anchor), old_anchor, turn=retire_turn
-        )
-    for old_anchor in reopen_anchors:
-        lifecycle.reopen_cell(
-            _summary_element_name(old_anchor), old_anchor, turn=retire_turn
-        )
-    for entry in window:
-        content = lifecycle.history.get(str(entry), {})
-        for element in fields:
-            if element in content:
-                lifecycle.end_cell(element, entry, turn=retire_turn)
-
-
-def _maybe_compress(runtime: "RuntimeComponents", *, manual_requested: bool = False) -> None:
-    """Best-effort periodic/overload/manual summary compression.
-
-    Runs as its own small transaction after a turn (or a bare /compat
-    request) commits: recompute from the just-saved tables, mutate, validate,
-    save again — the same pattern _restore_committed_patches already uses.
-    A failure here (e.g. the provider call) is non-fatal; it must never lose
-    the conversational turn that already committed successfully.
-    """
-
-    if not _compact_enabled(runtime.cfg):
-        return
-    current_turn = _last_turn(runtime.tables.history)
-    if current_turn < 1:
-        return
-    overload_threshold, prompt, interval_turns, keep_recent_turns, fields = _compact_settings(
-        runtime.cfg
-    )
-    last_summary_turn = _last_summary_turn(runtime.tables.history)
-    periodic_runtime = ProcessorRuntime(last_run_turn=last_summary_turn)
-    context_size = context_byte_size(runtime.tables.context)
-    due = (
-        is_due_periodic(
-            current_turn, periodic_runtime, step=interval_turns, first_run_turn=interval_turns
-        )
-        or is_due_overload(context_size, threshold_bytes=overload_threshold)
-        or is_due_manual(manual_requested)
-    )
-    if not due:
-        return
-
-    end_turn = current_turn - keep_recent_turns
-    if end_turn < 1:
-        return
-    start_turn = _first_uncompressed_turn(
-        runtime.tables.history, runtime.tables.state, end_turn, fields
-    )
-    if start_turn is None:
-        return  # nothing new has accumulated past the keep-recent window yet
-
-    # Only raw turns are summarized. A summary is produced once, for the
-    # stretch of history it covers, and never fed back through the model —
-    # so nothing is ever re-compressed and no summary is a summary of
-    # summaries.
-    window: tuple[int, ...] = tuple(range(start_turn, end_turn + 1))
-    transcript = _window_transcript(runtime.tables.history, window, fields)
-    if not transcript.strip():
-        return
-    try:
-        summary_text = compact["summary"](
-            runtime, transcript, prompt, turn_id=current_turn
-        )
-    except Exception as exc:  # noqa: BLE001 - compression must never crash a turn
-        print(f"[compress skipped: {exc}]")
-        return
-    if not summary_text:
-        return
-
-    # Retention picks from every summary ever written — including ones that
-    # went invisible several compactions ago, since they are all still in
-    # history. Whatever it picks becomes visible until the next compaction:
-    # dropped ones get their current range segment closed, revived ones get
-    # a fresh segment appended. No summary is recomputed either way.
-    all_anchors = sorted({*_all_summary_anchors(runtime.tables.history), end_turn})
-    visible_anchors = set(
-        _active_summary_anchors(runtime.tables.history, runtime.tables.state)
-    )
-    keep_anchors = runtime.retain_summaries(
-        anchors=all_anchors,
-        current_turn=current_turn,
-        **runtime.retention_params,
-    )
-    retire_anchors = tuple(sorted(visible_anchors - set(keep_anchors)))
-    reopen_anchors = tuple(
-        sorted(set(keep_anchors) - visible_anchors - {end_turn})
-    )
-
-    history = copy.deepcopy(runtime.tables.history)
-    lifecycle: FixedTableLifecycle = manager["lifecycle.fixed"](
-        history, runtime.tables.life_cycle, current_turn=current_turn
-    )
-    _apply_summary_result(
-        lifecycle,
-        anchor_turn=end_turn,
-        retire_turn=current_turn,
-        summary_text=summary_text,
-        window=window,
-        fields=fields,
-        retire_anchors=retire_anchors,
-        reopen_anchors=reopen_anchors,
-        covered_turns=window,
-    )
-    lifecycle.validate()
-    state = lifecycle.state_snapshot()
-    context = runtime.select_context(
-        history, state, through_turn=current_turn, roles=runtime.element_roles
-    )
-    saver["history.save"](runtime.tables, history)
-    saver["state.save"](runtime.tables, state)
-    saver["context.save"](runtime.tables, context)
-    print(f"[compressed turns {start_turn}-{end_turn} into {end_turn}_summary]")
-
-
-def _create_pin(runtime: "RuntimeComponents", content: str, *, origin: str) -> None:
-    """/pin: the same small standalone-transaction pattern _maybe_compress
-    uses — recompute from the just-saved tables, mutate, validate, save
-    again. Attaches to the last committed turn rather than starting a new
-    one; a pin is a note about what already happened, not a new exchange."""
-
-    current_turn = _last_turn(runtime.tables.history)
-    if current_turn < 1:
-        print("[pin skipped: no committed turn to attach to yet]")
-        return
-    history = copy.deepcopy(runtime.tables.history)
-    lifecycle: FixedTableLifecycle = manager["lifecycle.fixed"](
-        history, runtime.tables.life_cycle, current_turn=current_turn
-    )
-    element = _pin_element_name(origin, _next_pin_id(history))
-    lifecycle.add_slot(element, content, turn=current_turn)
-    lifecycle.validate()
-    state = lifecycle.state_snapshot()
-    context = runtime.select_context(
-        history, state, through_turn=current_turn, roles=runtime.element_roles
-    )
-    saver["history.save"](runtime.tables, history)
-    saver["state.save"](runtime.tables, state)
-    saver["context.save"](runtime.tables, context)
-    print(f"[pin created: {element}] {content}")
-
-
-def _cancel_pin(runtime: "RuntimeComponents", pin_id: str) -> None:
-    current_turn = _last_turn(runtime.tables.history)
-    found = _find_pin_element(runtime.tables.history, pin_id)
-    if found is None:
-        print(f"[cancelpin: no such pin {pin_id}]")
-        return
-    element, born_turn = found
-    history = copy.deepcopy(runtime.tables.history)
-    lifecycle: FixedTableLifecycle = manager["lifecycle.fixed"](
-        history, runtime.tables.life_cycle, current_turn=current_turn
-    )
-    # turn=current_turn + 1: the pin was genuinely active through the turn
-    # that already happened (and was shown then) — cancelling doesn't
-    # rewrite that, it only stops the pin from here on.
-    lifecycle.end_cell(element, born_turn, turn=current_turn + 1)
-    lifecycle.validate()
-    state = lifecycle.state_snapshot()
-    context = runtime.select_context(
-        history, state, through_turn=current_turn, roles=runtime.element_roles
-    )
-    saver["history.save"](runtime.tables, history)
-    saver["state.save"](runtime.tables, state)
-    saver["context.save"](runtime.tables, context)
-    print(f"[pin cancelled: {element}]")
-
-
 INSTRUCTION_SUFFIX = "_instruction"
 
 
@@ -734,70 +269,6 @@ def _restore_output_instructions(cfg: Any, tables: DatasetTables) -> None:
     state = lifecycle.state_snapshot()
     saver["history.save"](tables, history)
     saver["state.save"](tables, state)
-
-
-def _restore_committed_patches(cfg: Any, tables: DatasetTables) -> None:
-    """Materialize YAML patches that belong to already committed turns."""
-
-    latest = _last_turn(tables.history)
-    history = copy.deepcopy(tables.history)
-    scheduled: list[tuple[int, int, ContentPatch]] = []
-    for source_index, source_patch in enumerate(_configured_patches(cfg)):
-        born = int(source_patch.created_turn or 0)
-        for turn in range(born, latest + 1):
-            occurrence = patch["content.for_turn"](source_patch, turn)
-            if occurrence is not None:
-                scheduled.append((turn, source_index, occurrence))
-
-    for _, _, content_patch in sorted(scheduled):
-        patch_turn = int(content_patch.created_turn or 0)
-        turns = content_patch.turns
-        range_end = (
-            None
-            if isinstance(turns, float) and isinf(turns)
-            else patch_turn + turns - 1
-        )
-
-        expected = {
-            "content": content_patch.content,
-            "range": [[[patch_turn, range_end], 1.0, "none"]],
-        }
-        existing = history.setdefault(str(patch_turn), {}).get(
-            content_patch.element
-        )
-        if existing != expected:
-            history[str(patch_turn)].pop(content_patch.element, None)
-
-        lifecycle: FixedTableLifecycle = manager["lifecycle.fixed"](
-            history,
-            tables.life_cycle,
-            current_turn=max(0, patch_turn - 1),
-        )
-        if content_patch.mode in (ContentPatchMode.ROLL, ContentPatchMode.REFRESH):
-            lifecycle.end_active(content_patch.element, turn=patch_turn)
-        if existing != expected:
-            lifecycle.add_slot(
-                content_patch.element,
-                content_patch.content,
-                turn=patch_turn,
-                remain=content_patch.turns,
-            )
-
-    lifecycle = manager["lifecycle.fixed"](
-        history,
-        tables.life_cycle,
-        current_turn=latest,
-    )
-    expected_state = lifecycle.state_snapshot()
-    expected_context = select_context_without_extra_filter(
-        history, expected_state, roles=_element_roles(cfg)
-    )
-    if history != tables.history:
-        saver["history.save"](tables, history)
-    if expected_state != tables.state:
-        saver["state.save"](tables, expected_state)
-    if expected_context != tables.context:
-        saver["context.save"](tables, expected_context)
 
 
 @manager("tables.initialize")
@@ -1056,56 +527,6 @@ class TurnTransaction:
         self.state = self.lifecycle.state_snapshot()
 
 
-def _commit_patch_only_turn(runtime: "RuntimeComponents") -> int:
-    """Commit a turn that carries nothing but this moment's due patches —
-    no user, no assistant.
-
-    A bare "/element content mode turns" submission used to be invisible:
-    queue_patch stored it and the loop `continue`d, so it only became
-    visible once some later real exchange happened to land on the same
-    turn_id and carried the patched element alongside its own user/
-    assistant slots. That made a system change look like it was piggybacking
-    on whatever conversation came next, instead of being its own event in
-    the ledger. This gives it a turn of its own, the same way a real
-    exchange gets one — mirrors TurnTransaction.begin/prepare_input/commit's
-    shape, minus the user input and provider call neither apply here.
-    """
-
-    turn_id = _last_turn(runtime.tables.history) + 1
-    patches = runtime.patches_for_turn(turn_id)
-    if not patches:
-        return turn_id
-
-    history = copy.deepcopy(runtime.tables.history)
-    lifecycle: FixedTableLifecycle = manager["lifecycle.fixed"](
-        history, runtime.tables.life_cycle, current_turn=turn_id - 1
-    )
-    for content_patch in patches:
-        if content_patch.mode in (ContentPatchMode.ROLL, ContentPatchMode.REFRESH):
-            lifecycle.end_active(content_patch.element, turn=turn_id)
-        lifecycle.end_active(f"{content_patch.element}_end", turn=turn_id)
-
-    lifecycle.expire_turn(turn_id)
-
-    for content_patch in patches:
-        lifecycle.add_slot(
-            content_patch.element,
-            content_patch.content,
-            turn=turn_id,
-            remain=content_patch.turns,
-        )
-
-    state = lifecycle.state_snapshot()
-    context = runtime.select_context(
-        history, state, through_turn=turn_id, roles=runtime.element_roles
-    )
-    saver["history.save"](runtime.tables, history)
-    saver["state.save"](runtime.tables, state)
-    saver["context.save"](runtime.tables, context)
-    runtime.consume_patches(turn_id)
-    return turn_id
-
-
 @dataclass
 class RuntimeComponents:
     cfg: Any
@@ -1353,60 +774,6 @@ def _element_roles(cfg: Any) -> dict[str, str]:
     return roles
 
 
-def _recall_search_fields(cfg: Any) -> tuple[str, ...]:
-    """Which elements recall is allowed to search, from recall.search_fields.
-
-    Required whenever recall is on, and for a concrete reason: recall only
-    considers retired slots, so in a config where the conversational slots
-    never retire, the only thing left to find is whatever expires every turn
-    — the model's own discarded reasoning. Naming the searchable evidence is
-    what keeps a lookup pointed at evidence."""
-
-    section = cfg.to_dict().get("recall")
-    section = section if isinstance(section, dict) else {}
-    declared = section.get("search_fields")
-    if not isinstance(declared, list) or not declared:
-        raise ValueError(
-            "启用 recall 时必须声明 recall.search_fields："
-            "回忆只搜已退役的槽位，不指明搜哪些元素就只会捞到每轮自动退役的东西"
-        )
-    return tuple(str(item) for item in declared if item)
-
-
-def _recall_trigger_settings(cfg: Any) -> tuple[str, dict[str, Any]]:
-    """Read recall.trigger. Accepts a bare name ("always") or a mapping
-    carrying the trigger's own parameters ({type: pattern, pattern: ...})."""
-
-    section = cfg.to_dict().get("recall")
-    section = section if isinstance(section, dict) else {}
-    trigger = section.get("trigger")
-    if isinstance(trigger, str):
-        return trigger, {}
-    if not isinstance(trigger, dict):
-        return DEFAULT_RECALL_TRIGGER, {}
-    name = str(trigger.get("type") or DEFAULT_RECALL_TRIGGER)
-    return name, {key: value for key, value in trigger.items() if key != "type"}
-
-
-def _require_recall_life_cycle(cfg: Any) -> None:
-    """An undeclared element defaults to permanent, which is right for most
-    slots and quietly wrong for recall: every turn's pulled-back evidence
-    would stay visible forever and pile up. Rather than hardcode a different
-    default for one element name, refuse to guess and make the config say
-    how long recalled evidence lives."""
-
-    if _choice(cfg, "recall", "type", "none") == "none":
-        return
-    life_cycle = cfg.to_dict().get("life_cycle")
-    life_cycle = life_cycle if isinstance(life_cycle, dict) else {}
-    _recall_search_fields(cfg)
-    if RECALL_ELEMENT not in life_cycle:
-        raise ValueError(
-            f"启用 recall 时必须在 life_cycle 里声明 {RECALL_ELEMENT} 的生命周期，"
-            f"例如 {RECALL_ELEMENT}: [born, born]（只在提问那一轮可见）"
-        )
-
-
 @manager("runtime.build")
 def build_runtime(
     cfg: Any,
@@ -1523,7 +890,7 @@ def _model_status(runtime: "RuntimeComponents") -> Callable[[], dict]:
     """
 
     def status() -> dict:
-        from ..provider.provider import CONFIG_DIR, PROVIDER_DEFAULTS
+        from ..provider.provider import CONFIG_DIR, PROVIDER_DEFAULTS, _installed_ollama_models
 
         config = getattr(runtime.provider, "config", None)
         saved = (
@@ -1553,93 +920,6 @@ def _model_status(runtime: "RuntimeComponents") -> Callable[[], dict]:
     return status
 
 
-def _write_provider_to_yaml(cfg: Any, *, vendor: str, config_name: str) -> str:
-    """Point the task YAML's ``provider`` block at the newly chosen model.
-
-    This project's rule (README: "终端输入会先写回实验 yaml……运行期间只有
-    一份生效配置") is that anything which changes configuration lands in the
-    YAML, not only in memory — otherwise the file on disk quietly disagrees
-    with what is running, and a restart silently reverts the change. A model
-    picked in the browser is exactly such a change, so it is written back the
-    same way terminal overrides and ContentPatches already are
-    (_append_terminal_input, patch["yaml.write"]).
-
-    Only the two scalars under ``provider:`` are rewritten, in place —
-    comments, anchors and every other block keep their exact text, which a
-    parse-and-redump would destroy.
-    """
-
-    from pathlib import Path
-
-    path = Path(cfg.source_path)
-    text = path.read_text(encoding="utf-8")
-    lines = text.splitlines(keepends=True)
-    out: list[str] = []
-    inside = False
-    wrote_type = wrote_config = False
-    for line in lines:
-        stripped = line.strip()
-        if not inside:
-            if re.match(r"^provider\s*:\s*$", line.rstrip("\n")):
-                inside = True
-            out.append(line)
-            continue
-        # The block ends at the first line that is neither indented nor blank.
-        if stripped and not line[:1].isspace():
-            if not wrote_type:
-                out.append(f"  type: {vendor}\n")
-            if not wrote_config:
-                out.append(f"  config: {config_name}\n")
-            inside = False
-            out.append(line)
-            continue
-        if re.match(r"^\s+type\s*:", line):
-            out.append(f"  type: {vendor}\n")
-            wrote_type = True
-            continue
-        if re.match(r"^\s+config\s*:", line):
-            out.append(f"  config: {config_name}\n")
-            wrote_config = True
-            continue
-        out.append(line)
-    if inside:  # provider block ran to end of file
-        if not wrote_type:
-            out.append(f"  type: {vendor}\n")
-        if not wrote_config:
-            out.append(f"  config: {config_name}\n")
-    path.write_text("".join(out), encoding="utf-8")
-    return str(path)
-
-
-def _installed_ollama_models(base_url: str) -> list[str]:
-    """Ask a local Ollama what it has pulled. Best-effort: an unreachable or
-    slow daemon yields an empty list rather than blocking the page."""
-
-    import json as _json
-    import urllib.error
-    import urllib.request
-
-    from ..provider.provider import PROVIDER_DEFAULTS, _urlopen
-
-    root = (base_url or PROVIDER_DEFAULTS["ollama"]["base_url"]).rstrip("/")
-    if not root:
-        return []
-    try:
-        request = urllib.request.Request(f"{root}/api/tags", method="GET")
-        with _urlopen(request, timeout=2) as response:
-            payload = _json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError, ValueError, RuntimeError):
-        return []
-    models = payload.get("models") if isinstance(payload, dict) else None
-    if not isinstance(models, list):
-        return []
-    return sorted(
-        str(entry.get("name"))
-        for entry in models
-        if isinstance(entry, dict) and entry.get("name")
-    )
-
-
 def _model_switch(runtime: "RuntimeComponents") -> Callable[[dict], dict]:
     """Swap the answering model mid-session, optionally saving the config.
 
@@ -1660,6 +940,7 @@ def _model_switch(runtime: "RuntimeComponents") -> Callable[[dict], dict]:
         from ..provider.provider import (
             PROVIDER_DEFAULTS,
             ProviderConfig,
+            _write_provider_to_yaml,
             build_provider,
             load_provider_config,
             save_provider_config,

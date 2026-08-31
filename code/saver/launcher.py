@@ -61,8 +61,7 @@ def _free_port(preferred: int = 8777) -> int:
 
 def _options() -> dict[str, Any]:
     """Everything the panel offers, with the default already chosen."""
-    from ..manager.runtime import _installed_ollama_models
-    from ..provider.provider import CONFIG_DIR, PROVIDER_DEFAULTS
+    from ..provider.provider import CONFIG_DIR, PROVIDER_DEFAULTS, _installed_ollama_models
 
     installed = _installed_ollama_models(PROVIDER_DEFAULTS["ollama"]["base_url"])
     saved = sorted(p.name for p in CONFIG_DIR.glob("*.json")) if CONFIG_DIR.is_dir() else []
