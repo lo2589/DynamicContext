@@ -21,7 +21,7 @@
   background:var(--paper);color:var(--ink);font:inherit;font-size:11.5px}
 #live-settings-apply{align-self:flex-start;padding:6px 13px;border:1px solid var(--live);
   border-radius:6px;background:var(--live);color:var(--paper);font:inherit;font-size:12px;cursor:pointer}
-#live-send .status{color:var(--ink-2);font-size:11.5px;min-width:7em}
+#live-send .status{color:var(--ink-2);font-size:11.5px;min-width:0;max-width:45%}
 /* The in-progress reply is a message, so it is rendered as one, in the
    transcript, using the viewer's own bubble classes — .b.t for reasoning and
    .b.a for the answer, exactly as a committed turn looks. */

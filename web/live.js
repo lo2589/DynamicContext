@@ -179,9 +179,42 @@
     return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
   }
 
+  // A bare "/element content mode turns" line (code/patch/state_patch.py's
+  // own grammar) never produces a reply — the runtime queues it and moves
+  // on without running a turn (code/manager/runtime.py's main loop: a
+  // ContentPatch with no accompanying user text hits `continue`, skipping
+  // process_turn entirely). Sent through the ordinary reply-waiting path
+  // below, the box would sit on "waiting for reply…" until the ~400-try
+  // timeout — which is exactly what looked like the page hanging.
+  var BARE_PATCH = /^\/\S+\s+.+\s+(remain|remian|roll|refresh)\s+([1-9]\d*|none)$/
+
+  function sendPatchOnly(text) {
+    button.disabled = true
+    status.textContent = "queuing…"
+    fetch("send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: text }),
+    })
+      .then(function (r) { return r.ok ? r.json() : r.json().then(function (e) { throw new Error(e.error || r.statusText) }) })
+      .then(function () {
+        input.value = ""
+        // No reply to wait for and nothing new lands in the transcript yet
+        // — the patch takes effect starting the next real turn, not this
+        // click — so this is the entire round trip, not a first step.
+        status.textContent = "patch queued — takes effect from the next turn"
+      })
+      .catch(function (err) { status.textContent = "failed: " + err.message })
+      .then(function () { button.disabled = false })
+  }
+
   function send() {
     var text = input.value.trim()
     if (!text) return
+    if (BARE_PATCH.test(text)) {
+      sendPatchOnly(text)
+      return
+    }
     var sent = text  // kept so a failed turn can hand the draft back
     button.disabled = true
     status.textContent = "sending…"
@@ -533,15 +566,25 @@
         vendors = data.vendors || {}
         installed = data.installed || []
         now.textContent = data.current.provider + " / " + data.current.model
-        rebuildModels(data.current.model)
         if (!vendorSel.options.length) {
           Object.keys(vendors).forEach(function (v) {
             var o = document.createElement("option")
             o.value = v; o.textContent = v
             vendorSel.appendChild(o)
           })
+        }
+        // Re-synced to what is actually running on every poll, not just
+        // the first one — otherwise a vendor merely clicked to look at once
+        // sits there forever, and the next blind Apply silently targets it
+        // with no key (this is what "glm api_key cannot be empty" was:
+        // the form still held glm from an earlier look, current provider
+        // had long since moved on). Skipped while the form is open — that
+        // is the one moment the selection is the user's, mid-edit, and
+        // overwriting it there would be the opposite bug.
+        if (!form.classList.contains("open")) {
           vendorSel.value = data.current.provider
-          fillDefaults()
+          urlIn.value = data.current.base_url || ""
+          rebuildModels(data.current.model)
         }
         // Rebuild the saved-config list; a just-saved file must show up.
         var keep = savedSel.value

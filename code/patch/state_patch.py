@@ -11,6 +11,7 @@ import re
 from typing import Any, Optional, Union
 
 from ..dataset.table_manager import ColumnId, RowId
+from ..lifecycle.span import INF, Remain, validate_remain
 from ..registry import patch as patch_registry
 
 
@@ -33,6 +34,11 @@ class RowPatchMode(str, Enum):
 class ContentPatchMode(str, Enum):
     REMAIN = "remain"
     ROLL = "roll"
+    # Ends whatever is currently active in the element (like ROLL), then
+    # starts one cell that does not expire on its own (like REMAIN with
+    # turns=INF) -- the previous value becomes invalid immediately, and the
+    # new one stands until another patch (of any mode) replaces it.
+    REFRESH = "refresh"
 
 
 @dataclass(frozen=True)
@@ -41,7 +47,7 @@ class ContentPatch:
     element: str
     content: str
     mode: ContentPatchMode
-    turns: int
+    turns: Remain
     created_turn: Optional[int] = None
 
 
@@ -55,7 +61,7 @@ def content_patch_for_turn(
     if content_patch.created_turn is None:
         raise ValueError("ContentPatch缺少created_turn")
     born = content_patch.created_turn
-    if content_patch.mode == ContentPatchMode.REMAIN:
+    if content_patch.mode in (ContentPatchMode.REMAIN, ContentPatchMode.REFRESH):
         return content_patch if turn == born else None
     if born <= turn < born + content_patch.turns:
         # A rolling value is a new one-turn cell on every covered turn.
@@ -74,7 +80,7 @@ def content_patch_pending_after(
         raise ValueError("ContentPatch缺少created_turn")
     last_turn = (
         content_patch.created_turn
-        if content_patch.mode == ContentPatchMode.REMAIN
+        if content_patch.mode in (ContentPatchMode.REMAIN, ContentPatchMode.REFRESH)
         else content_patch.created_turn + content_patch.turns - 1
     )
     return turn < last_turn
@@ -101,8 +107,10 @@ def create_content_patch(
         raise ValueError("patch element不能为空")
     if not normalized_content:
         raise ValueError("patch content不能为空")
-    if isinstance(turns, bool) or not isinstance(turns, int) or turns < 1:
-        raise ValueError("patch turns必须是正整数")
+    try:
+        validate_remain(turns)
+    except ValueError:
+        raise ValueError("patch turns必须是正整数或none(无限期)") from None
     if created_turn is not None and (
         isinstance(created_turn, bool)
         or not isinstance(created_turn, int)
@@ -121,15 +129,15 @@ def create_content_patch(
 
 PATCH_INPUT_PATTERN = re.compile(
     r"^/(?P<element>\S+)\s+(?P<content>.+)\s+"
-    r"(?P<mode>remain|remian|roll)\s+(?P<turns>[1-9]\d*)$"
+    r"(?P<mode>remain|remian|roll|refresh)\s+(?P<turns>[1-9]\d*|none)$"
 )
 INLINE_PATCH_INPUT_PATTERN = re.compile(
     r"^(?:(?P<user>.+?)\s+)?/(?P<element>\S+)\s+(?P<content>.+)\s+"
-    r"(?P<mode>remain|remian|roll)\s+(?P<turns>[1-9]\d*)$"
+    r"(?P<mode>remain|remian|roll|refresh)\s+(?P<turns>[1-9]\d*|none)$"
 )
 PATCH_FIRST_INPUT_PATTERN = re.compile(
     r"^/(?P<element>\S+)\s+(?P<content>.+?)\s+"
-    r"(?P<mode>remain|remian|roll)\s+(?P<turns>[1-9]\d*)"
+    r"(?P<mode>remain|remian|roll|refresh)\s+(?P<turns>[1-9]\d*|none)"
     r"(?:\s+(?P<user>.+))?$"
 )
 
@@ -138,12 +146,14 @@ def _patch_from_match(match: re.Match[str], creator: str) -> ContentPatch:
     mode = match.group("mode")
     if mode == "remian":
         mode = "remain"
+    turns_text = match.group("turns")
+    turns: Remain = INF if turns_text == "none" else int(turns_text)
     return patch_registry["create"](
         creator=creator,
         element=match.group("element"),
         content=match.group("content"),
         mode=mode,
-        turns=int(match.group("turns")),
+        turns=turns,
     )
 
 
@@ -160,7 +170,8 @@ def parse_patch_input(
     match = PATCH_INPUT_PATTERN.fullmatch(normalized_input)
     if match is None:
         raise ValueError(
-            "patch格式必须是 /元素 内容 remain 正整数 或 /元素 内容 roll 正整数"
+            "patch格式必须是 /元素 内容 remain|roll 正整数，"
+            "或 /元素 内容 refresh none（内容在模式前面，不是后面）"
         )
     return _patch_from_match(match, creator)
 
@@ -237,13 +248,15 @@ def _content_patch_yaml(
     content_patch: ContentPatch,
 ) -> list[str]:
     quote = lambda value: json.dumps(value, ensure_ascii=False)
+    turns = content_patch.turns
+    turns_text = "none" if isinstance(turns, float) and isinf(turns) else str(turns)
     return [
         f"    {patch_id}:",
         f"      creator: {quote(content_patch.creator)}",
         f"      element: {quote(content_patch.element)}",
         f"      content: {quote(content_patch.content)}",
         f"      mode: {quote(content_patch.mode.value)}",
-        f"      turns: {content_patch.turns}",
+        f"      turns: {turns_text}",
         f"      created_turn: {content_patch.created_turn}",
     ]
 
@@ -386,6 +399,20 @@ def _self_test() -> None:
     assert content_patch.element == "goal"
     assert content_patch.content == "翻译后文"
     assert content_patch.turns == 5
+
+    # refresh: ends whatever is active on arrival (like roll) but the new
+    # cell itself never expires on its own (like remain, turns=INF) --
+    # that's what "system1 refresh, system2 refresh, ..." sandwiching needs.
+    _, refreshed = extract_patch_input("/system 新提示词 refresh none")
+    assert refreshed is not None
+    assert refreshed.mode == ContentPatchMode.REFRESH
+    assert refreshed.turns == INF
+    dated = replace(refreshed, created_turn=6)
+    assert content_patch_for_turn(dated, 5) is None
+    assert content_patch_for_turn(dated, 6) == dated
+    assert content_patch_for_turn(dated, 7) is None
+    assert content_patch_pending_after(dated, 6) is False
+    assert content_patch_pending_after(dated, 5) is True
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import copy
 import json
 import re
 from dataclasses import dataclass, field
+from math import isinf
 from typing import Any, Callable
 
 from .context import select_context_without_extra_filter
@@ -30,6 +31,7 @@ from ..dataset.resume_context import DatasetContext
 from ..dataset.tables import DatasetTables
 from ..lifecycle.process import process
 from ..lifecycle.rules import end_functions, resolve_bound
+from ..lifecycle.span import INF
 from ..patch.state_patch import ContentPatch, ContentPatchMode
 from ..provider import ParsedAnswer, build_provider_from_cfg
 from ..recall import recall as recall_registry
@@ -214,13 +216,14 @@ def _configured_patches(cfg: Any) -> list[ContentPatch]:
     for patch_id, value in values.items():
         if not isinstance(value, dict):
             raise ValueError(f"context.patches.{patch_id}必须是mapping")
+        turns = value["turns"]
         patches.append(
             patch["create"](
                 creator=value.get("creator", "user"),
                 element=value["element"],
                 content=value["content"],
                 mode=value["mode"],
-                turns=value["turns"],
+                turns=INF if turns == "none" else turns,
                 created_turn=value["created_turn"],
             )
         )
@@ -288,7 +291,7 @@ def _range_active_at(slot: dict[str, Any], turn: int) -> bool:
 def _source_owns_occurrence(source: ContentPatch, turn: int) -> bool:
     if source.created_turn is None:
         return False
-    if source.mode == ContentPatchMode.REMAIN:
+    if source.mode in (ContentPatchMode.REMAIN, ContentPatchMode.REFRESH):
         return turn == source.created_turn
     return source.created_turn <= turn < source.created_turn + source.turns
 
@@ -748,12 +751,16 @@ def _restore_committed_patches(cfg: Any, tables: DatasetTables) -> None:
 
     for _, _, content_patch in sorted(scheduled):
         patch_turn = int(content_patch.created_turn or 0)
+        turns = content_patch.turns
+        range_end = (
+            None
+            if isinstance(turns, float) and isinf(turns)
+            else patch_turn + turns - 1
+        )
 
         expected = {
             "content": content_patch.content,
-            "range": [
-                [[patch_turn, patch_turn + content_patch.turns - 1], 1.0, "none"]
-            ],
+            "range": [[[patch_turn, range_end], 1.0, "none"]],
         }
         existing = history.setdefault(str(patch_turn), {}).get(
             content_patch.element
@@ -766,7 +773,7 @@ def _restore_committed_patches(cfg: Any, tables: DatasetTables) -> None:
             tables.life_cycle,
             current_turn=max(0, patch_turn - 1),
         )
-        if content_patch.mode == ContentPatchMode.ROLL:
+        if content_patch.mode in (ContentPatchMode.ROLL, ContentPatchMode.REFRESH):
             lifecycle.end_active(content_patch.element, turn=patch_turn)
         if existing != expected:
             lifecycle.add_slot(
@@ -849,7 +856,7 @@ class TurnTransaction:
         # Historical effects happen before expiration so a patch can change the
         # cells that would otherwise expire on this turn.
         for content_patch in self.patches:
-            if content_patch.mode == ContentPatchMode.ROLL:
+            if content_patch.mode in (ContentPatchMode.ROLL, ContentPatchMode.REFRESH):
                 self.lifecycle.end_active(content_patch.element, turn=self.turn_id)
             # A new value reopens this element, so an earlier ending no longer
             # applies even when the previous value used remain mode.
@@ -1049,6 +1056,56 @@ class TurnTransaction:
         self.state = self.lifecycle.state_snapshot()
 
 
+def _commit_patch_only_turn(runtime: "RuntimeComponents") -> int:
+    """Commit a turn that carries nothing but this moment's due patches —
+    no user, no assistant.
+
+    A bare "/element content mode turns" submission used to be invisible:
+    queue_patch stored it and the loop `continue`d, so it only became
+    visible once some later real exchange happened to land on the same
+    turn_id and carried the patched element alongside its own user/
+    assistant slots. That made a system change look like it was piggybacking
+    on whatever conversation came next, instead of being its own event in
+    the ledger. This gives it a turn of its own, the same way a real
+    exchange gets one — mirrors TurnTransaction.begin/prepare_input/commit's
+    shape, minus the user input and provider call neither apply here.
+    """
+
+    turn_id = _last_turn(runtime.tables.history) + 1
+    patches = runtime.patches_for_turn(turn_id)
+    if not patches:
+        return turn_id
+
+    history = copy.deepcopy(runtime.tables.history)
+    lifecycle: FixedTableLifecycle = manager["lifecycle.fixed"](
+        history, runtime.tables.life_cycle, current_turn=turn_id - 1
+    )
+    for content_patch in patches:
+        if content_patch.mode in (ContentPatchMode.ROLL, ContentPatchMode.REFRESH):
+            lifecycle.end_active(content_patch.element, turn=turn_id)
+        lifecycle.end_active(f"{content_patch.element}_end", turn=turn_id)
+
+    lifecycle.expire_turn(turn_id)
+
+    for content_patch in patches:
+        lifecycle.add_slot(
+            content_patch.element,
+            content_patch.content,
+            turn=turn_id,
+            remain=content_patch.turns,
+        )
+
+    state = lifecycle.state_snapshot()
+    context = runtime.select_context(
+        history, state, through_turn=turn_id, roles=runtime.element_roles
+    )
+    saver["history.save"](runtime.tables, history)
+    saver["state.save"](runtime.tables, state)
+    saver["context.save"](runtime.tables, context)
+    runtime.consume_patches(turn_id)
+    return turn_id
+
+
 @dataclass
 class RuntimeComponents:
     cfg: Any
@@ -1090,11 +1147,29 @@ class RuntimeComponents:
     def queue_patch(self, content_patch: ContentPatch) -> None:
         if content_patch.created_turn is None:
             raise ValueError("ContentPatch缺少created_turn")
+        # created_turn is computed once, when a patch is queued, from the
+        # ledger's current length — and a patch-only submission never grows
+        # the ledger (run_runtime's main loop `continue`s without calling
+        # process_turn). Two "/element ... mode turns" submissions back to
+        # back, with no real turn landing between them, therefore land on
+        # the identical created_turn: not a corner case, the ordinary
+        # outcome of queuing more than one system-prompt change in a row.
+        # Materializing both would collide (add_slot refuses to overwrite an
+        # existing cell); a newer instruction for the same not-yet-happened
+        # slot means "I changed my mind", so it replaces the older one
+        # rather than piling up.
+        def _not_superseded(item: ContentPatch) -> bool:
+            return not (
+                item.element == content_patch.element
+                and item.created_turn == content_patch.created_turn
+            )
+
+        self.queued_patches = list(filter(_not_superseded, self.queued_patches))
+        self.source_patches = list(filter(_not_superseded, self.source_patches))
         self.queued_patches.append(content_patch)
         self.queued_patches.sort(key=lambda item: int(item.created_turn or 0))
-        if content_patch not in self.source_patches:
-            self.source_patches.append(content_patch)
-            self.source_patches.sort(key=lambda item: int(item.created_turn or 0))
+        self.source_patches.append(content_patch)
+        self.source_patches.sort(key=lambda item: int(item.created_turn or 0))
 
     def patch_endings_for_turn(
         self,
@@ -1159,7 +1234,21 @@ class RuntimeComponents:
             patch["content.for_turn"](item, turn_id)
             for item in self.queued_patches
         ]
-        return [item for item in materialized if item is not None]
+        occurrences = [item for item in materialized if item is not None]
+        # Two independent sources can still land on the same element at the
+        # same turn even after queue_patch's own same-created_turn dedup —
+        # a still-mid-window roll source re-fires every turn on its own,
+        # untouched by anything queued after it, and can walk straight into
+        # a later patch that happens to schedule for one of its turns.
+        # add_slot refuses to double-write a cell either way, so the same
+        # "newest instruction wins" rule applies here at materialization
+        # time: self.queued_patches is created_turn-sorted with a stable
+        # sort, so for a shared turn the later list position is the more
+        # recently queued source — keep only that one per element.
+        latest_per_element: dict[str, ContentPatch] = {}
+        for occurrence in occurrences:
+            latest_per_element[occurrence.element] = occurrence
+        return list(latest_per_element.values())
 
     def consume_patches(self, turn_id: int) -> None:
         self.queued_patches = [
@@ -1587,12 +1676,23 @@ def _model_switch(runtime: "RuntimeComponents") -> Callable[[dict], dict]:
                     f"unsupported provider {vendor!r}；可选：{', '.join(PROVIDER_DEFAULTS)}"
                 )
             defaults = PROVIDER_DEFAULTS[vendor]
+            api_key = str(payload.get("api_key") or "")
+            # A blank key field is never "clear the key" — the field is never
+            # pre-filled with the real value in the first place (read only
+            # ever reports has_api_key, not the secret), so an untouched
+            # blank means "leave it alone", not "delete it". If the running
+            # provider already has one for this same vendor, keep it instead
+            # of manufacturing a config that can never pass validation.
+            if not api_key:
+                current_config = getattr(runtime.provider, "config", None)
+                if current_config is not None and current_config.provider == vendor:
+                    api_key = current_config.api_key
             config = ProviderConfig.from_dict(
                 {
                     "provider": vendor,
                     "model": str(payload.get("model") or "").strip() or defaults["model"],
                     "base_url": str(payload.get("base_url") or "").strip() or defaults["base_url"],
-                    "api_key": str(payload.get("api_key") or ""),
+                    "api_key": api_key,
                     "timeout": payload.get("timeout") or 300,
                 }
             )
@@ -2057,6 +2157,16 @@ def run_runtime(runtime: RuntimeComponents) -> None:
         session_id = None
     last_input_error: str | None = None
     repeated_input_errors = 0
+    # The 3-strikes shutdown below exists for a source with no one at the
+    # wheel: a bad dataset path spins next() in a hot loop, printing the
+    # identical error as fast as the CPU allows, forever. real_user has a
+    # person behind every call — next() blocks on their next action either
+    # way, so there is no hot loop to guard against, and the same rule would
+    # instead mean a human mistyping one command three times silently ends
+    # their whole session.
+    interactive_input = str(
+        (runtime.cfg.to_dict().get("input_data") or {}).get("type") or ""
+    ) == "real_user"
     try:
         while True:
             try:
@@ -2065,18 +2175,19 @@ def run_runtime(runtime: RuntimeComponents) -> None:
                 print()
                 break
             except ValueError as exc:
-                # A malformed line is worth skipping; a source that fails the
-                # same way every time is not, and `continue` alone turned that
-                # into a hot loop printing the identical error thousands of
-                # times (a dataset path that does not exist does exactly
-                # this). Retry a few times, then stop and say why.
                 message = str(exc)
                 if message == last_input_error:
                     repeated_input_errors += 1
                 else:
                     last_input_error, repeated_input_errors = message, 1
                 print(f"[input error] {message}")
-                if repeated_input_errors >= 3:
+                # A browser has no console to read that line from. Report it
+                # on the very first occurrence, not only once a source has
+                # proven it fails the same way every time — a page waiting
+                # on a single malformed /patch line otherwise polls forever
+                # with nothing to show, indistinguishable from a hung turn.
+                runtime.last_error = message
+                if not interactive_input and repeated_input_errors >= 3:
                     runtime.last_error = f"输入源持续失败，已停止：{message}"
                     print("[input source failed repeatedly; stopping]")
                     break
@@ -2119,6 +2230,12 @@ def run_runtime(runtime: RuntimeComponents) -> None:
                     f"[patch queued: turn={item.created_turn} "
                     f"element={item.element} mode={item.mode.value}]"
                 )
+                # No user text rides along, so there is nothing for a real
+                # exchange to attach this patch to — give it its own turn
+                # right now instead of leaving it to piggyback on whichever
+                # turn happens to come next.
+                committed_turn = _commit_patch_only_turn(runtime)
+                print(f"[patch committed as its own turn {committed_turn}]")
                 continue
 
             # The terminal has always watched generation arrive chunk by

@@ -3,7 +3,12 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
-
+doc/*
+task/*
+data/*
+doc/
+task/
+data/
 # Local analysis/runtime state
 .codedendrite/
 .code_genome_db.json
@@ -26,3 +31,4 @@ config/*
 
 # Playwright CLI scratch output (snapshots, console logs)
 .playwright-cli/
+.screenshot/
