@@ -232,6 +232,7 @@ python3 run_self_tests.py
 ## 项目边界
 
 - 已实现：真实 provider、流式与非流式调用、固定表事务、生命周期、运行时 patch、summary 压缩、grep recall、pin、恢复、本地 viewer、单任务与多任务托管。
+- `pi-dynamiccontext/`：把生命周期规则层移植为 pi 扩展包的实验性实现（规则快照、turn_end 结算、context_edit 落账、pin、recall 工具）。
 - 尚未实现：非 `none` 的 tools/search provider 集成、远程/多用户服务、HTTP 写接口的 Origin/令牌防护。
 - 性能取舍：每轮会重放账本以重算投影，单轮开销随历史长度线性增长。
 

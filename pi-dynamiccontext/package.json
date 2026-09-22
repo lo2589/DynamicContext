@@ -1,0 +1,23 @@
+{
+  "name": "pi-dynamiccontext",
+  "version": "0.1.0",
+  "description": "Declarative lifecycle rules over an append-only slot ledger, as a pi extension",
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.87.0",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.87.1",
+    "typebox": "*",
+    "typescript": "^5",
+    "@types/node": "^22"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  }
+}

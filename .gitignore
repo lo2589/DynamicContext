@@ -33,6 +33,9 @@ config/*
 # Agent working notes (internal, never ship)
 CLAUDE.md
 
+# JS toolchain output (pi-dynamiccontext typecheck)
+node_modules/
+
 # Playwright CLI scratch output (snapshots, console logs)
 .playwright-cli/
 .screenshot/
