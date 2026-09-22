@@ -24,6 +24,8 @@ pi install /path/to/DynamicContext/pi-dynamiccontext
 
 默认规则：`toolResult: born+5`，其余 permanent。规则在槽位**出生时快照**——`/dc-rule` 改的是未来槽位的默认（forward 语义），不动存量。
 
+**轮的口径**：一轮 = 一次完整的用户交互。工具循环内部 pi 会触发多次 `turn_end`，但这些不推进轮次——同一次请求里出生的工具结果共享同一个 bornTurn，`born+5` 意味着五次用户交互，而不是五次工具调用。
+
 ## 命令
 
 | 命令 | 作用 |

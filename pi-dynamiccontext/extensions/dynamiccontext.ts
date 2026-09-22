@@ -33,6 +33,7 @@ interface Snapshot {
   slots: Record<string, SlotMeta>;
   pins: string[];
   turn: number;
+  lastUserEntryId: string | null;
 }
 
 const SNAPSHOT_TYPE = "dynamiccontext";
@@ -82,6 +83,7 @@ export default function (pi: ExtensionAPI) {
   let slots = new Map<string, SlotMeta>();
   let pins = new Set<string>();
   let currentTurn = 0;
+  let lastUserEntryId: string | null = null;
 
   function snapshotData(): Snapshot {
     return {
@@ -89,6 +91,7 @@ export default function (pi: ExtensionAPI) {
       slots: Object.fromEntries(slots),
       pins: [...pins],
       turn: currentTurn,
+      lastUserEntryId,
     };
   }
 
@@ -164,15 +167,27 @@ export default function (pi: ExtensionAPI) {
         slots = new Map(Object.entries(s.slots));
         pins = new Set(s.pins);
         currentTurn = s.turn;
+        lastUserEntryId = s.lastUserEntryId ?? null;
       }
     }
   });
 
   pi.on("turn_end", async (event, ctx) => {
-    // pi's turnIndex restarts per process/run; the ledger needs a counter
-    // that survives -c continuations, so we keep our own and increment it
-    // once per settled turn (restored from the snapshot on session_start).
-    currentTurn += 1;
+    // A turn is one user interaction, not one model call: pi fires turn_end
+    // for every step of a tool loop, so we advance the ledger turn only when
+    // a new user message appears on the branch. Everything born inside one
+    // tool loop shares the same bornTurn, and born+5 means five user
+    // interactions — not five tool calls.
+    const branch: Entry[] = ctx.sessionManager.getBranch();
+    let newestUser: string | null = null;
+    for (const entry of branch) {
+      if (entry?.type === "message" && entry.message?.role === "user")
+        newestUser = entry.id;
+    }
+    if (newestUser && newestUser !== lastUserEntryId) {
+      currentTurn += 1;
+      lastUserEntryId = newestUser;
+    }
     const { drafts, changed } = settle(ctx);
     const extra: Entry[] = [];
     if (changed || drafts.length > 0)
