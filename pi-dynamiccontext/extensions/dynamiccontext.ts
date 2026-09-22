@@ -169,7 +169,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("turn_end", async (event, ctx) => {
-    currentTurn = event.turnIndex;
+    // pi's turnIndex restarts per process/run; the ledger needs a counter
+    // that survives -c continuations, so we keep our own and increment it
+    // once per settled turn (restored from the snapshot on session_start).
+    currentTurn += 1;
     const { drafts, changed } = settle(ctx);
     const extra: Entry[] = [];
     if (changed || drafts.length > 0)
