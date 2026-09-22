@@ -1,1 +1,1 @@
-"""simple_chat_runtime implementation modules."""
+"""DynamicContext implementation modules."""

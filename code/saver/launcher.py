@@ -813,7 +813,7 @@ button.go:disabled{opacity:.55;cursor:default}
 </style></head>
 <body>
 <div class="card">
-  <div class="eyebrow">simple chat runtime</div>
+  <div class="eyebrow">dynamic context</div>
   <h1>开一局新的</h1>
   <p class="sub">每项都有默认值，直接点开始就能跑。面板不替代 yaml——它写出一份 yaml，
   然后用它启动，之后你随时可以自己改那份文件重跑。</p>

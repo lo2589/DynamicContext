@@ -1,4 +1,4 @@
-# Simple Chat Runtime
+# DynamicContext
 
 一个由 YAML 驱动、把对话上下文保存为可审计槽位账本的本地多轮对话 runtime。
 
@@ -20,8 +20,8 @@ Provider 最终收到的仍是标准 `system` / `user` / `assistant` 消息。�
 安装：
 
 ```bash
-git clone <repository-url> simple_chat_runtime
-cd simple_chat_runtime
+git clone <repository-url>
+cd DynamicContext
 
 python3 -m venv .venv
 source .venv/bin/activate       # Windows PowerShell: .venv\Scripts\Activate.ps1

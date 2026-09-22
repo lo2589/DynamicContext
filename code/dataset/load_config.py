@@ -107,7 +107,7 @@ class Config(ConfigNode):
 def parse(argv: Any = None) -> argparse.Namespace:
     """Require one YAML source or one output directory for a copied YAML."""
 
-    parser = argparse.ArgumentParser(description="Load simple_chat_runtime YAML.")
+    parser = argparse.ArgumentParser(description="Load DynamicContext YAML.")
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument(
         "--config",

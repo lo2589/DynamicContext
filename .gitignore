@@ -9,6 +9,7 @@ data/*
 doc/
 task/
 data/
+doc/*
 # Local analysis/runtime state
 .codedendrite/
 .code_genome_db.json
@@ -28,6 +29,9 @@ task/*
 config/*
 !config/standard/
 !config/standard/**
+
+# Agent working notes (internal, never ship)
+CLAUDE.md
 
 # Playwright CLI scratch output (snapshots, console logs)
 .playwright-cli/
