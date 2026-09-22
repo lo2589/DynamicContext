@@ -1,41 +1,94 @@
 # Simple Chat Runtime
 
-一个 YAML 驱动的多轮对话 runtime。核心主张：上下文不是一段拼起来的文本，是两个正交的维度——
+一个由 YAML 驱动、把对话上下文保存为可审计槽位账本的本地多轮对话 runtime。
 
-- **纵向**：一次发言拆成哪些槽位（`user` / `think` / `assistant` / 模型自己开的标签…）
-- **横向**：每个槽位在哪些轮次可见，由一条声明决定，不是由代码里散落的判断决定
+普通聊天系统通常把上下文当成不断增长的消息列表；这个项目把它拆成两个正交维度：
 
-对模型而言，看到的仍然是普通的 `user`/`assistant` 消息列表；兼容性在渲染层解决，表达力在账本层获得。
+- 一轮由哪些槽位组成，例如 `user`、`think`、`assistant`、`recall`、`pin_*` 和模型自定义标签。
+- 每个槽位在哪些轮次进入 context，由生命周期声明决定，而不是散落在代码里的特殊判断。
 
-## 启动
+Provider 最终收到的仍是标准 `system` / `user` / `assistant` 消息。额外结构只存在于本地账本和投影层，因此可以检查“历史写过什么”“当前保留什么”以及“这一轮实际发送了什么”。
+
+> 当前状态：experimental。核心 runtime、真实模型调用、生命周期、压缩、回捞、pin、运行时 patch 和本地可视化均可使用；`tools` 与 `search` 目前只有 `none` 实现。所有 HTTP 服务仅绑定 `127.0.0.1`，但写接口尚未加入 Origin/会话令牌校验，不要把端口转发或反向代理到局域网、公网。
+
+## 环境要求
+
+- Python 3.11（当前开发和自测版本；代码至少需要 Python 3.10）
+- `pip`
+- 一个真实模型服务：Ollama，或 GLM / DeepSeek / MiniMax 的兼容 API
+
+安装：
 
 ```bash
-cd DynamicContext
+git clone <repository-url> simple_chat_runtime
+cd simple_chat_runtime
+
+python3 -m venv .venv
+source .venv/bin/activate       # Windows PowerShell: .venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
+
+## 最快启动
+
+没有现成配置时，启动本地设置面板：
+
+```bash
+python3 start.py
+```
+
+浏览器会打开 `http://127.0.0.1:8775/`。选择 provider、model、任务名和输入方式后，面板会在本机创建：
+
+- `config/config-provider/<name>.json`：provider、model、base URL、API key 和 timeout。
+- `task/<name>/runtime.yaml`：这个会话唯一生效的运行配置。
+- `task/<name>/` 下的固定表：历史、状态、context、生命周期、patch 和原始响应。
+
+Provider 配置与非标准任务默认被 Git 忽略。API key 只写入本机 provider 配置，页面和 `show` 命令不会回显其原文。
+
+已有 YAML 时可直接运行：
+
+```bash
+python3 main.py --config task/<name>/runtime.yaml
+```
+
+同时托管多个任务：
+
+```bash
+python3 serve_all.py
+python3 serve_all.py --task first --task second --port 9000
+```
+
+## 命令行配置 Provider
+
+标准 YAML `config/standard/runtime.yaml` 引用本机的 `config/config-provider/provider.json`。首次使用前创建它：
+
+```bash
+# Ollama；默认会执行 ollama pull
+python3 -m code.provider init --vendor ollama --model qwen3:8b
+
+# 云端 provider；key 会写入权限为 0600 的本地配置文件
+python3 -m code.provider init --vendor glm --model GLM-4.5-Air
+python3 -m code.provider init --vendor deepseek --api-key "$DEEPSEEK_API_KEY"
+python3 -m code.provider init --vendor minimax
+```
+
+然后可以启动标准任务：
+
+```bash
 python3 main.py --config config/standard/runtime.yaml
 ```
 
-没有现成 yaml 时，给一个输出目录，加载器会把默认 yaml 复制进去再从副本启动：
+检查配置或直接发一次真实请求：
 
 ```bash
-python3 main.py --output-dir ./task/new_experiment
+python3 -m code.provider show
+python3 -m code.provider chat "只回答 OK" --turn-id 1
 ```
 
-公开仓库只包含脱敏样例 `config/standard/` 和 `task/standard/`。其他
-`config/`、`task/` 内容以及 provider 凭据默认被 Git 忽略，仅保留在本机。
+运行时没有可由 YAML 选择的 dry-run/fake provider。自测使用的确定性 stub 只在测试函数内部通过依赖注入创建，生产配置无法访问。
 
-`--config` 和 `--output-dir` 二选一，都不给直接报错。终端还能补充：
+## 配置模型
 
-```text
---input-type     输入类型
---input-path     输入文件
---dataset-path   数据输出目录
-```
-
-优先级是 `终端输入 > YAML > 默认值`；终端输入会先写回实验 yaml，再从这份 yaml 重新加载——运行期间只有一份生效配置，不是内存里叠了好几层。
-
-## 装配顺序
-
-`main.py` 只保留这五行，可见即真实：
+一次运行只有一份生效 YAML。入口装配顺序保持显式：
 
 ```python
 cfg = load_cfg()
@@ -45,97 +98,91 @@ runtime = manager["runtime.build"](cfg, tables=tables, input_data=input_data)
 manager["runtime.run"](runtime)
 ```
 
-每一轮内部：
+主要配置区：
 
-```text
-生命周期规则逐个结算（谁该退场、谁该回场）
-→ 写入本轮 user
-→ context 由声明投影出来 → 调用 provider
-→ 解析回答，原始响应先落盘（raw.jsonl），再切成 think / assistant / 模型自定义标签
-→ validate → 四表提交
-```
+| 区域 | 作用 |
+|---|---|
+| `provider` | 引用本机 provider JSON |
+| `chat` / `answer` | 调用方式、输出解析和槽位角色 |
+| `input_data` | 终端、GUI 或数据集输入 |
+| `life_cycle` | 各类槽位的出生与结束规则 |
+| `compact` | 压缩字段、阈值、周期和保留窗口 |
+| `recall` | 回捞实现与触发规则 |
+| `dataset` | 任务目录和固定表文件名 |
+| `runtime.viewer` | 本地网页、端口、刷新间隔 |
+| `context` | context 投影、必需槽位、角色和 patch |
 
-用户在生成期间打断时，`chat.normal` 返回已经生成的部分，runtime 照常解析并保存；provider 异常不会提交这一轮。
+命令行的 `--input-type`、`--input-path`、`--dataset-path` 会覆盖 YAML，并先写回任务 YAML 再重新加载。运行期间不会叠加第二份隐式配置。
 
-## 槽位与区间
+## 账本与生命周期
 
-一条记录是 `(轮, 槽位) → (内容, 区间列表)`：
+一条槽位记录由 `(turn, element)` 唯一标识：
 
 ```json
-"range": [[[21, 21], 1.0, "none"], [[23, null], 1.0, "none"]]
+{
+  "content": "example",
+  "range": [[[21, 21], 1.0, "none"], [[23, null], 1.0, "none"]]
+}
 ```
 
-每段是 `[[起, 止], 密度, 压缩器]`，**闭区间**：上例读作"第 21 轮出场，第 22 轮缺席，第 23 轮起再次出场"。中间的缺口不是删除的痕迹——账本里那条内容一个字没动，区间列表只是记录了它曾经、以及此刻是否出场。
+区间为闭区间。这个例子表示槽位在第 21 轮可见、第 22 轮缺席、第 23 轮起重新可见；内容本身没有被删除或改写。
 
-写入的通道互不相识，各自命名自己的记录：输入回声写 `user`；输出解析写 `think`、`assistant`、`pin_*`；压缩写 `NN_summary`；回捞写 `recall`；运行时补丁写配置中未声明的新元素。没有中央调度按名字分派。
+常用结束规则：
 
-## 生命周期：区间的端点是函数，不是常数
+| 名称 | 含义 |
+|---|---|
+| `born` | 只在出生轮可见 |
+| `born+n` | 出生后再保留 n 轮 |
+| `null` / `permanent` | 永不自动结束 |
+| `cycle` | 输入重新指向该轮时退场 |
+| `labelled` | 按数据集标记决定临时或永久 |
+| `until_cancelled` | 保留到显式取消，pin 使用此规则 |
+| `until_goal_end` | 保留到 goal 结束 |
 
-`life_cycle` 的一条声明形如 `[起, 止]`，`止` 是一个注册过的函数名：
-
-```yaml
-life_cycle:
-  system:    [1, null]
-  user:      [born, cycle]
-  think:     [born, born]        # 想完就扔，不进下一轮
-  assistant: [born, cycle]
-```
-
-当前注册表（`code/lifecycle/rules.py`）：
-
-| 名字 | 答案 | 何时可知 |
-|---|---|---|
-| `born` | 生在哪轮就哪轮结束 | 出生时 |
-| `born+n` | 出生轮 + n（`n` 是参数，`born+3` 会拆成 `born_add(n=3)`，不会把参数塞进名字里） | 出生时 |
-| `permanent` | 不结束（写 `null` 等价于这个） | 出生时 |
-| `until_cancelled` / `until_goal_end` | 等一个事件 | 事件到达时 |
-| `cycle` | 输入指回这一轮时缺席 | 每轮 |
-| `labelled` | 输入打了标的按 `born` 结束，没打的按 `permanent` 不结束 | 每轮 |
-
-一条规则属于"出生时就能算完"还是"每轮都要重新问"，写在函数自己身上（`@each_turn` 装饰器），不是靠反射猜函数签名。加一条新规则就是加一个函数 + 一次注册，不改边界解析、不改失效队列、不改流的格式，也不改其余任何一条规则。
-
-## 注册表
-
-八个目录各自维护一份注册表，yaml 里写名字，运行时查表拿函数：
+每轮执行顺序：
 
 ```text
-lifecycle   born / born_add / permanent / cycle / labelled / until_cancelled / until_goal_end
-compact     summary / sum / goal_collapse / retain.last_k / retain.keep_all / retain.equidistant / retain.latest_only / add_constant
-recall      grep / trigger.always / trigger.manual / trigger.never / trigger.pattern / none
-patch       add_row / cell / create / forward / force_refresh / reset_from_now / content.for_turn / content.pending_after / input.extract / input.parse / row / yaml.write
-dataset     input.type.* / input.interface.* / storage.local / config.load / history.* / context.resume …
-provider    client.deepseek / client.glm / client.minimax / client.ollama / cfg.* / chat.normal / chat.no_stream / answer.parse.normal / answer.parse.tagged / tools.none / search.none
-saver       history.save / state.save / context.save / life_cycle.save / patch.append / raw.append / print.tables / print.none
-manager     tables.initialize / runtime.build / runtime.run / lifecycle.fixed / context.select.none
+结算生命周期和运行时 patch
+→ 写入本轮 user / recall 等输入槽位
+→ 投影本轮实际 context
+→ 调用真实 provider
+→ 保存 raw response 并解析 think / assistant / tags / pins
+→ validate
+→ 原子提交 history、state、context 和 life_cycle
+→ 按配置检查压缩
 ```
 
-`chat.no_stream` 是给流式响应不可靠的 provider 用的——它调 provider 的非流式接口，一次性拿完整 message 再解析，避免流式分片在推理/回答边界上出错。
+Provider 失败时本轮不提交。用户中断流式生成时，已经生成的部分会被解析并作为一次完整事务提交。
 
-## Provider 配置
+## 固定表
 
-每个 `config/config-provider/*.json` 是一份独立的 `(厂商, 模型, base_url, key, timeout)` 配置，yaml 里 `provider.config` 直接按文件名引用——一个模型一个文件，不是一个文件塞多个模型（`ProviderConfig.model` 是标量字符串，这是运行时的数据结构决定的，不是约定）。
+每个任务目录通常包含：
 
-```bash
-python3 -m code.provider init      # 交互式创建一份新配置
-python3 -m code.provider show      # 查看已保存的配置（不显示 key 原文）
-python3 -m code.provider chat "只回答 OK" --turn-id 1   # 用某份配置发一次真实请求
-```
+| 文件 | 内容 |
+|---|---|
+| `history.jsonl` | 只追加的槽位账本 |
+| `state_latest.json` | 当前槽位可见性投影 |
+| `context_latest.json` | 最近一次提交后的 OpenAI 形状 context |
+| `life_cycle.json` | 生命周期声明 |
+| `patches.jsonl` | 运行时 patch 记录 |
+| `raw_history.jsonl` | provider 原始输出 |
+| `snapshots/` | 可选的周期快照 |
 
-支持的厂商：`glm` / `deepseek` / `minimax` / `ollama`。
+`state = π(history, life_cycle)`，`context = render(state)`。状态与 context 可以从账本和声明重算；修改声明不需要回写历史内容。
 
-没有假回复模式：能选的每一个厂商都会真的发请求。测试用的确定性桩只存在于
-`code/manager/runtime.py` 的自测里，通过 `build_runtime(provider_instance=…)` 注入，
-任何 yaml 都够不着它。
+仓库只跟踪合成的 `task/standard/` 样例，不包含真实用户数据、凭据或 benchmark 输出。
 
-## 压缩、回捞、钉住
+## 本地网页
 
-三者签名一致：压缩 `流 × 字段集 × 压缩器 → 流`，回捞 `流 × 查询 → 流`，钉住 `流 × 内容 → 流`。摘要是流中一条普通记录，"压缩摘要"就是压缩作用在一条恰好是摘要的记录上，不是另一套代码路径。
+将任务 YAML 中的 `input_data.interface` 设为 `gui`，并启用 `runtime.viewer.enabled`，即可在本地网页中：
 
-`pin`（`until_cancelled`）是唯一让内容不随距离衰减的机制——被钉住的东西声明上永远在场，不需要被重新提起才能留下来。
+- 发送消息并查看真实流式输出。
+- 同步查看本轮 context、聊天灰态、slot × turn 矩阵和 token 估算。
+- 切换已保存模型配置。
+- 编辑生命周期规则，执行 pin、压缩、隐藏、恢复和删除操作。
+- 在多个本地任务间切换。
 
-## 可重算
-
-`state = π(流, 声明)`，`context = render(state)`——投影不写流，因此状态和上下文完全由流与声明决定：状态文件可以删除后重算，相同输入必得相同上下文，改声明不用回溯改数据。代价是每轮重放全流，单轮开销随轮数线性增长。
+页面和管理服务只监听 loopback。它们不是为多用户、远程部署或不受信任网页环境设计的；在 Origin/令牌保护完成前，不要通过 SSH 转发、容器端口映射或反向代理暴露。
 
 ## 自测
 
@@ -143,4 +190,25 @@ python3 -m code.provider chat "只回答 OK" --turn-id 1   # 用某份配置发�
 python3 run_self_tests.py
 ```
 
-在一个解释器里依次导入每个模块并跑它的 `_self_test`，避免 `python -m` 重复导入触发注册表的重名检查。
+自测在一个解释器中依次导入模块并运行各模块的 `_self_test`。需要绑定 loopback 端口的 viewer/launcher 测试必须允许本机 socket。
+
+当前完整自测结果：25 passed，0 failed，1 个模块没有自测入口。真实模型是否可用仍取决于本机 provider 服务与配置。
+
+## 项目边界
+
+- 已实现：真实 provider、流式与非流式调用、固定表事务、生命周期、运行时 patch、summary 压缩、grep recall、pin、恢复、本地 viewer、单任务与多任务托管。
+- 尚未实现：非 `none` 的 tools/search provider 集成、远程/多用户服务、HTTP 写接口的 Origin/令牌防护。
+- 性能取舍：每轮会重放账本以重算投影，单轮开销随历史长度线性增长。
+
+## 发布与贡献
+
+提交前至少运行：
+
+```bash
+python3 run_self_tests.py
+git diff --check
+```
+
+请勿提交 `task/` 中的真实会话、`config/config-provider/`、API key、模型输出或浏览器测试截图。若改动生命周期、投影或 viewer 时序，应同时增加对应模块自测，并用真实 provider 验证生成中与落账后的状态一致。
+
+本项目尚未选择开源许可证。在根目录加入明确的 `LICENSE` 之前，公开可见不代表获得复制、修改或分发许可。

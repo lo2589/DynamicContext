@@ -19,6 +19,11 @@
           // removed every bubble after it and the jump rebuilt them — a full
           // rebuild in two steps, taking the per-turn controls with it.
           load(text, label + ' · ' + turns + ' rows · live', 'last')
+          // Before the scroll correction below, so it measures a pane whose
+          // height is already final: whoever reconciles the ledger is also
+          // the one who retires the provisional copy of the turn that just
+          // landed, in the same frame, rather than leaving both on the page.
+          if (window.__liveLedgerLoaded) window.__liveLedgerLoaded()
           // Measured on a live send: reconcile inserts a 32px turnmark above
           // this turn's bubbles that the streaming view never showed, so the
           // sentence resetChatToLatest lined up with the bottom ends up
@@ -107,6 +112,28 @@
   // tick() 在另一个 IIFE 里，落账校正要读这个状态，走 window。
   window.__liveStick = function () { return sticking }
 
+  // Take down the provisional block. Cleared and redrawn in one frame, so
+  // the transcript never holds the committed turn and a copy of it at once.
+  function dropProvisional() {
+    pendingUser = ""
+    pendingTurn = null
+    renderLive("")
+    if (window.clearLiveContextSnapshot) window.clearLiveContextSnapshot()
+  }
+
+  // The background poll runs on its own 1s interval and can land the
+  // committed turn before /streaming has admitted the generation is over.
+  // Between the two the transcript held both — the real bubbles and the
+  // provisional copy of the same sentence, a couple of hundred pixels of
+  // duplicate text that appeared and vanished again a moment later. The
+  // ledger arriving is the event that retires this block, so it is the one
+  // that clears it; finish() below is then only about the composer.
+  window.__liveLedgerLoaded = function () {
+    if (pendingTurn === null) return
+    if (window.ledgerHasTurn && !window.ledgerHasTurn(pendingTurn)) return
+    dropProvisional()
+  }
+
   // The stream carries the model's raw markup (<think>…</think> then the
   // answer). Split it the same way the ledger will, so what is shown while
   // generating matches what is shown once committed.
@@ -116,6 +143,9 @@
   // being asked. pendingUser is cleared together with the bubbles, at the
   // moment the committed turn (which contains the real user slot) lands.
   var pendingUser = ""
+  // The turn this provisional block belongs to, so it can carry the same
+  // "turn N" divider the committed turn will.
+  var pendingTurn = null
 
   // One node per bubble, created once and then only having its text updated.
   // Rebuilding innerHTML on every poll — 750ms while generating — destroyed
@@ -140,6 +170,30 @@
     }
     if (node.parentNode !== live) live.appendChild(node)
     return node
+  }
+
+  // A committed turn arrives with a "turn N" divider above its bubbles that
+  // the streaming view never showed — 32px appearing under text being read,
+  // at the moment of commit. Draw the same divider from the send instead: the
+  // real one then takes its place at the same height and nothing shifts.
+  // Deliberately marked, because the per-turn controls must not find it —
+  // there is no turn here yet to hide, restore or delete.
+  function setMark(turn) {
+    if (turn === null || turn === undefined) {
+      var old = slots["mark"]
+      if (old && old.parentNode) old.parentNode.removeChild(old)
+      return
+    }
+    var node = slots["mark"]
+    if (node === undefined) {
+      node = document.createElement("div")
+      node.className = "turnmark provisional"
+      node.appendChild(document.createTextNode(""))
+      slots["mark"] = node
+    }
+    if (node.parentNode !== live) live.appendChild(node)
+    var text = "turn " + turn
+    if (node.lastChild.nodeValue !== text) node.lastChild.nodeValue = text
   }
 
   function setSlot(key, className, tagText, text) {
@@ -167,16 +221,13 @@
       if (close === -1) { think = answer.slice(open + 7); answer = "" }
       else { think = answer.slice(open + 7, close); answer = answer.slice(close + 8) }
     }
+    setMark(pendingTurn)
     setSlot("user", "u", "", pendingUser)
     setSlot("think", "t", "think · generating", think.trim().slice(-400))
     setSlot("answer", "a", "assistant · generating", answer.trim())
     // 贴底时跟着长：回复往下延伸、底部始终钉住，是连续滚动而不是跳。
     // 没贴底（你上滚去读别的）就一个字都不动——读历史不被打扰的约定不变。
     if (sticking && chat) chat.scrollTop = chat.scrollHeight
-  }
-
-  function escapeHtml(s) {
-    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
   }
 
   // A bare "/element content mode turns" line (code/patch/state_patch.py's
@@ -226,8 +277,21 @@
       .then(function (r) { return r.ok ? r.json() : r.json().then(function (e) { throw new Error(e.error || r.statusText) }) })
       .then(function () {
         input.value = ""
+        // Transcript, timetable and context panel all move here, on one line,
+        // from what this page already knows: the ledger's own intervals say
+        // what is in context at the next turn, and the sentence just accepted
+        // is the rest of it. Waiting for /streaming to say so instead left
+        // the three panes disagreeing for as long as prepare_input took —
+        // your message in the transcript, the grid still on the previous
+        // turn, and the word "computing…" standing in for a context this
+        // page could have projected itself.
+        var projected = window.projectPendingTurn ? window.projectPendingTurn(sent) : null
         pendingUser = sent
+        pendingTurn = projected ? projected.turn : null
         renderLive("")
+        if (projected && window.setLiveContextSnapshot) {
+          window.setLiveContextSnapshot(projected.turn, projected.slots, projected.messages)
+        }
         // The one deliberate scroll in the page: you said something, so come
         // back to the live end of the conversation. Once, here, and nowhere
         // else — chat2 does the same thing in one line right after it appends.
@@ -247,27 +311,53 @@
         var tries = 0
         var started = Date.now()
         var sawActive = false
+        var finished = false
         function finish(message) {
+          if (finished) return
+          finished = true
           clearInterval(fast)
           status.textContent = message || ""
-          pendingUser = ""
           stopBtn.hidden = true
-          renderLive("")
-          window.__liveTick()  // make sure the committed turn is on screen
+          // Take the provisional block down only once the committed one is on
+          // the page. Clearing first and reconciling afterwards leaves a whole
+          // network round trip with your own sentence missing from the
+          // transcript, and the context panel fallen back to the previous
+          // turn — two state sources, briefly showing neither. Usually the
+          // ledger poll has already done this by now, in which case
+          // pendingTurn is null and the call is a no-op; a turn that failed
+          // outright never lands on the ledger at all and is retired here.
+          Promise.resolve(window.__liveTick()).then(dropProvisional)
           // No scrolling here on purpose. You did not ask for anything at
           // this moment — the provisional bubbles just became permanent ones
           // in the same place. Moving the pane now is the jump.
         }
-        var fast = setInterval(function () {
-          tries += 1
-          if (tries > 400) { finish("no reply"); return }
+        // Named so it can run once immediately (below) rather than only on
+        // the interval's own 750ms cadence: the sooner the server's own
+        // snapshot lands, the sooner anything this page projected for itself
+        // at the send is either confirmed or corrected.
+        function pollStreaming() {
           // Show generation as it arrives — the terminal has always had this
           // via on_chunk; without it a local model looks like a frozen page
           // for the tens of seconds it takes to answer.
-          fetch("streaming", { cache: "no-store" })
+          return fetch("streaming", { cache: "no-store" })
             .then(function (r) { return r.ok ? r.json() : null })
             .then(function (s) {
               if (!s) return
+              // The server's own account of the turn in flight, replacing
+              // what this page projected at the send. Gated on active because
+              // pending_* keeps its last value after the turn commits, and
+              // re-installing that would put the panes back on a turn the
+              // ledger has already superseded. An identical snapshot is
+              // dropped on the floor by setLiveContextSnapshot, so the usual
+              // case — the projection was right — redraws nothing.
+              if (s.active && s.pending_turn !== null && s.pending_turn !== undefined
+                  && window.setLiveContextSnapshot) {
+                window.setLiveContextSnapshot(
+                  s.pending_turn,
+                  s.pending_slots || [],
+                  s.pending_context || []
+                )
+              }
               if (s.active) {
                 sawActive = true
                 stopBtn.hidden = false
@@ -285,6 +375,12 @@
               }
             })
             .catch(function () {})
+        }
+        pollStreaming()
+        var fast = setInterval(function () {
+          tries += 1
+          if (tries > 400) { finish("no reply"); return }
+          pollStreaming()
           window.__liveTick().then(function (changed) {
             if (changed) { finish(""); return }
             // No new turn yet — it may simply be slow, or the turn may have
@@ -349,23 +445,65 @@
         ;(d.sessions || []).forEach(function (s) {
           var mine = s.task === here
           if (mine) seen = true
-          var target = d.hosted ? "/s/" + s.task + "/" : s.port
+          // Not running (no port): the value carries the task name, marked
+          // so onchange knows to start it rather than just navigate — a
+          // dormant task offered in the same list as live ones is the whole
+          // point, but it needs a POST first, not a URL that is not bound
+          // to anything yet.
+          var target = s.port == null
+            ? "task:" + s.task
+            : (d.hosted ? "/s/" + s.task + "/" : s.port)
+          var label = s.task + (mine ? "（这个）" : s.port == null ? "（未运行）" : "")
           html += '<option value="' + target + '"' + (mine ? " selected" : "") + ">" +
-            s.task + (mine ? "（这个）" : "") + "</option>"
+            label + "</option>"
         })
         if (!seen) html = '<option value="" selected>' + here + "（这个）</option>" + html
         // No "new run" entry here: the button beside this select already does
         // it, and offering the same action twice in one row is just noise.
+        //
+        // Rebuilt only when the list actually differs, and never while the
+        // select has the focus. Replacing the options of an open dropdown
+        // closes it and puts the selection back on this task — every five
+        // seconds, for as long as you were reading the list.
+        if (html === sessionSel.__html) return
+        if (document.activeElement === sessionSel) return
+        sessionSel.__html = html
         sessionSel.innerHTML = html
       })
       .catch(function () {})
   }
 
   sessionSel.onchange = function () {
-    if (!sessionSel.value) return
+    var value = sessionSel.value
+    if (!value) return
+    if (value.slice(0, 5) === "task:") {
+      var task = value.slice(5)
+      sessionSel.disabled = true
+      status.textContent = "正在启动 " + task + "…"
+      fetch("open-task", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: task }),
+      })
+        .then(function (r) { return r.json().then(function (d) { if (!r.ok) throw new Error(d.error || r.statusText); return d }) })
+        .then(function (d) {
+          // The server waits for the run to answer on its port before saying
+          // so. Following the URL anyway when it never came up lands on a
+          // refused connection, which looks exactly like the switch having
+          // silently done nothing — say where the reason is written instead.
+          if (d.serving === false) throw new Error(task + " 没能起来，看 task/" + task + "/run.log")
+          location.href = d.url
+        })
+        .catch(function (e) {
+          sessionSel.disabled = false
+          status.textContent = "切换失败：" + e.message
+          refreshSessions()  // put the dropdown back to what is actually running
+        })
+      return
+    }
     location.href = window.__hosted
-      ? sessionSel.value
-      : "http://127.0.0.1:" + sessionSel.value + "/"
+      ? value
+      : "http://127.0.0.1:" + value + "/"
   }
 
   // The stats row already answers "how big is this run" in slots; tokens and
@@ -551,6 +689,7 @@
   var nameManual = document.getElementById("live-model-name-manual")
   var vendors = {}
   var installed = []
+  var current = null
   var MANUAL = "__manual__"
 
   // What the model field currently means, wherever it is being read from.
@@ -565,6 +704,7 @@
         if (!data) return
         vendors = data.vendors || {}
         installed = data.installed || []
+        current = data.current
         now.textContent = data.current.provider + " / " + data.current.model
         if (!vendorSel.options.length) {
           Object.keys(vendors).forEach(function (v) {
@@ -624,7 +764,22 @@
     rebuildModels(d.model || "")
   }
 
-  toggle.onclick = function () { form.classList.toggle("open") }
+  toggle.onclick = function () {
+    // Opening (not closing) is the one moment the poll-skip above cannot
+    // cover: a stale selection from a much earlier look — or from before a
+    // server restart changed what is actually running — would otherwise
+    // still be sitting there the instant the panel reopens, and Apply would
+    // submit it as if the user had just chosen it. Force truth at that
+    // instant; the poll-skip then keeps it that way for the rest of the edit.
+    if (!form.classList.contains("open") && current) {
+      vendorSel.value = current.provider
+      urlIn.value = current.base_url || ""
+      rebuildModels(current.model)
+      keyIn.value = ""
+      savedSel.value = ""
+    }
+    form.classList.toggle("open")
+  }
   vendorSel.onchange = fillDefaults
   nameIn.onchange = syncManual
   savedSel.onchange = function () {
@@ -731,6 +886,9 @@
   function decorate() {
     Array.prototype.forEach.call(chat.querySelectorAll(".turnmark"), function (marker) {
       if (marker.querySelector(".turn-ops")) return
+      // The divider live.js draws for the turn being generated is not a turn
+      // yet: there is nothing to hide, restore or delete behind it.
+      if (marker.classList.contains("provisional")) return
       var turn = turnOf(marker)
       if (turn === null || turn === 0) return  // turn 0 is the system prompt
 

@@ -31,6 +31,9 @@
    Send already says "generating Ns", which is where a progress signal
    belongs — next to the control, not on the content. */
 #live-provisional .b{opacity:.82}
+/* The divider for the turn being generated, matched to the bubbles under
+   it: the committed one takes its place at the same height. */
+#live-provisional .turnmark{opacity:.82}
 #live-model{color:var(--ink-2);font-size:11px;letter-spacing:.04em;
   display:flex;gap:7px;align-items:center;flex-wrap:wrap}
 #live-model b{color:var(--ink);font-weight:600;letter-spacing:0}

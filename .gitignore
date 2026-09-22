@@ -32,3 +32,4 @@ config/*
 # Playwright CLI scratch output (snapshots, console logs)
 .playwright-cli/
 .screenshot/
+.*

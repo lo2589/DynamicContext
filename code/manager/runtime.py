@@ -435,6 +435,22 @@ class TurnTransaction:
                 through_turn=self.turn_id,
                 roles=self.runtime.element_roles,
             )
+        # Set these only once the pre-provider projection is complete.  The
+        # messages are what the model receives; the slot identities let the
+        # viewer apply that same truth to the transcript and timetable rather
+        # than independently re-deriving visibility from the last committed
+        # history file while this turn is still in flight.
+        self.runtime.pending_context = list(self.context)
+        self.runtime.pending_slots = [
+            {"turn": int(turn_id), "element": element}
+            for turn_id in sorted(self.history, key=int)
+            for element in self.history[turn_id]
+            if self.state.get(turn_id, {}).get(element, 0) == 1
+        ]
+        # Publish the turn last.  /streaming treats a missing turn as "still
+        # computing", so a polling thread can never combine a new turn id
+        # with the previous turn's context or slot list.
+        self.runtime.pending_turn = self.turn_id
 
     def call_and_parse(
         self,
@@ -557,6 +573,13 @@ class RuntimeComponents:
     # — the browser's equivalent of watching the stream scroll in a terminal.
     streaming: str = ""
     streaming_active: bool = False
+    # What prepare_input already selected before the provider was ever called
+    # — set the instant it's computed, not after the turn commits, so the
+    # page can show "what was actually sent" while the model is still
+    # answering instead of waiting out the whole round trip.
+    pending_context: Context = field(default_factory=list)
+    pending_slots: list[dict[str, int | str]] = field(default_factory=list)
+    pending_turn: int | None = None
     # IF-16. Set from another thread (the viewer's HTTP handler) to stop the
     # turn in flight. Checked in on_chunk rather than plumbed into the
     # provider: chat.normal already treats a KeyboardInterrupt raised anywhere
@@ -1233,11 +1256,14 @@ def _rederive_ranges(
             if slot is None:
                 continue
             born = int(turn_id)
+            start = resolve_bound(rule[0], born)
+            if start is None:
+                start = born
             end = resolve_bound(rule[1], born)
             style = (slot.get("range") or [[None, 1.0, "none"]])[0]
             density = style[1] if len(style) > 1 else 1.0
             compressor = style[2] if len(style) > 2 else "none"
-            slot["range"] = [[[born, end], density, compressor]]
+            slot["range"] = [[[start, end], density, compressor]]
 
     # Re-apply what compaction folded: each summary states the span it covers.
     for turn_id, content in history.items():
@@ -1410,6 +1436,9 @@ def run_runtime(runtime: RuntimeComponents) -> None:
                 streaming=lambda: {
                     "text": runtime.streaming,
                     "active": runtime.streaming_active,
+                    "pending_context": runtime.pending_context,
+                    "pending_slots": runtime.pending_slots,
+                    "pending_turn": runtime.pending_turn,
                 },
                 interrupt=_interrupt(runtime),
                 settings_read=_settings_read(runtime),
@@ -1525,6 +1554,13 @@ def run_runtime(runtime: RuntimeComponents) -> None:
             # frozen. Same callback, one more consumer: accumulate into a
             # buffer the page polls (GET /streaming).
             runtime.streaming = ""
+            # Do not let the first immediate browser poll label the previous
+            # turn's already-computed context as this one.  prepare_input
+            # publishes a coherent replacement, with pending_turn written
+            # last, before the provider is called.
+            runtime.pending_context = []
+            runtime.pending_slots = []
+            runtime.pending_turn = None
             runtime.streaming_active = True
             runtime.cancel_requested = False
 
@@ -1631,7 +1667,9 @@ def _self_test() -> None:
         assert runtime.tables.paths.history.name == "configured-history.jsonl"
         assert runtime.tables.paths.history.is_file()
         assert not (runtime.tables.paths.root / "history.jsonl").exists()
-        assert runtime.tables.state == {"0": {"system": 1}}
+        # The configured system interval starts at 1, so its turn-0 anchor
+        # does not make it visible before that interval begins.
+        assert runtime.tables.state == {"0": {"system": 0}}
 
         runtime.input_data.push_user("/goal ship runtime remain 5")
         content_patch = runtime.input_data.next()
@@ -1664,6 +1702,17 @@ def _self_test() -> None:
             "role": "assistant",
             "content": "id：1",
         }
+        # The live snapshot is the prompt as sent, not the post-answer
+        # context saved at commit.  In particular this turn's generated
+        # think/assistant slots must not light up beside a two-message prompt.
+        assert runtime.pending_turn == 1
+        assert runtime.pending_context[-1] == {"role": "user", "content": "hello"}
+        pending_keys = {
+            (item["turn"], item["element"]) for item in runtime.pending_slots
+        }
+        assert (1, "user") in pending_keys
+        assert (1, "think") not in pending_keys
+        assert (1, "assistant") not in pending_keys
 
         resumed_cfg = load_config(config_path)
         resumed = build_stub_runtime(resumed_cfg)

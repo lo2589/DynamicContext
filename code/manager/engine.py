@@ -300,14 +300,22 @@ class FixedTableLifecycle:
                     str(slot.get("content") or ""),
                     actor="input",
                 )
-                self.engine.lifecycle.start_cell_until(
-                    element,
-                    turn,
-                    end_turn=self._internal_end(slot),
-                    born_turn=turn,
-                    active_at=current_turn,
-                )
+                self._project_cell(element, turn, slot, current_turn)
         self.validate()
+
+    def _project_cell(self, element: str, born: int, slot: Mapping[str, Any], at: int) -> None:
+        self.engine.lifecycle.start_cell_until(
+            element, born, end_turn=self._internal_end(slot), born_turn=born, active_at=at,
+        )
+        # A cell may start after its anchor or have gaps between reopened ranges.
+        visible = any(
+            int(entry[0][0]) <= at and (entry[0][1] is None or at <= int(entry[0][1]))
+            for entry in slot.get("range", [])
+        ) and (slot.get("dead") is None or at < int(slot["dead"]))
+        if not visible:
+            self.engine.tables.set(CURRENT, element, born, False, actor="lifecycle")
+            self.engine.lifecycle.state.active_finite[element].discard(born)
+            self.engine.lifecycle.state.active_permanent[element].discard(born)
 
     @property
     def current_turn(self) -> int:
@@ -318,6 +326,9 @@ class FixedTableLifecycle:
             raise ValueError("不能向过去推进生命周期")
         self.engine.lifecycle.expire_turn(turn)
         self.engine.lifecycle.state.current_turn = turn
+        for born, row in self.history.items():
+            for element, slot in row.items():
+                self._project_cell(element, int(born), slot, turn)
 
     def add_slot(
         self,

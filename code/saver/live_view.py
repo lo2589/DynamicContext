@@ -242,9 +242,23 @@ class Handler(BaseHTTPRequestHandler):
             # it here (not only from the hub) is what lets the page offer a
             # switcher instead of making the user remember port numbers.
             from .session_registry import HUB_PORT, LAUNCHER_HINT, list_sessions
+            from .launcher import _existing_runs
+
+            live = list_sessions()
+            live_tasks = {entry["task"] for entry in live.values()}
+            # Every task/**/runtime.yaml, not just the ones with a process
+            # bound right now — picking one that is not live is what /open-task
+            # is for. A run with a ledger but no yaml (_existing_runs' "orphan"
+            # case) cannot be started this way and is left out rather than
+            # offered as a switch target that would only 400.
+            dormant = [
+                {"task": run["task"], "port": None, "turns": run["turns"]}
+                for run in _existing_runs()
+                if run["task"] not in live_tasks and run["has_yaml"]
+            ]
 
             self._send_json({
-                "sessions": list(list_sessions().values()),
+                "sessions": list(live.values()) + dormant,
                 "here": str(self.task_dir.name),
                 "launcher": LAUNCHER_HINT,
                 "hub": HUB_PORT,
@@ -254,7 +268,15 @@ class Handler(BaseHTTPRequestHandler):
             # reason /last-error is: the page polls this constantly, and a
             # 503 would read as a failure rather than "nothing to show".
             self._send_json(
-                self.streaming() if self.streaming else {"text": "", "active": False}
+                self.streaming()
+                if self.streaming
+                else {
+                    "text": "",
+                    "active": False,
+                    "pending_context": [],
+                    "pending_slots": [],
+                    "pending_turn": None,
+                }
             )
         else:
             self.send_error(404)
@@ -413,6 +435,26 @@ class Handler(BaseHTTPRequestHandler):
             from .launcher import ensure_launcher
 
             self._send_json({"url": ensure_launcher()})
+            return
+        if path == "/open-task":
+            # Switching the session dropdown to a task with no port needs
+            # somewhere to send it. create_run already does exactly this —
+            # an existing task/yaml pair is resumed verbatim (only the port
+            # is refreshed), a task with no yaml yet is rejected — so this
+            # calls straight into it rather than growing a second, narrower
+            # copy of the same "is this a resume or a fresh task" branch.
+            from .launcher import create_run
+
+            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                payload = json.loads(self.rfile.read(length) or b"{}")
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                self._send_json({"error": "invalid JSON body"}, status=400)
+                return
+            try:
+                self._send_json(create_run({"task": str(payload.get("task") or "")}))
+            except (ValueError, FileNotFoundError, OSError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
             return
         if path not in self.CONTROL_PATHS:
             self.send_error(404)
@@ -874,6 +916,13 @@ def _self_test() -> None:
                 "saved": [],
             },
             model_switch=_fake_switch,
+            streaming=lambda: {
+                "text": "partial",
+                "active": True,
+                "pending_context": [{"role": "user", "content": "hello"}],
+                "pending_slots": [{"turn": 2, "element": "user"}],
+                "pending_turn": 2,
+            },
         )
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -912,6 +961,11 @@ def _self_test() -> None:
                 models = json.loads(response.read())
             assert models["current"]["provider"] == "ollama"
             assert "ollama" in models["vendors"]
+            with opener.open(f"http://127.0.0.1:{port}/streaming") as response:
+                stream = json.loads(response.read())
+            assert stream["pending_turn"] == 2
+            assert stream["pending_slots"] == [{"turn": 2, "element": "user"}]
+            assert stream["pending_context"] == [{"role": "user", "content": "hello"}]
             status, reply = post("/model", {"provider": "glm", "model": "GLM-4.5-Air"})
             assert status == 200 and reply["ok"] is True
             assert switched[-1]["model"] == "GLM-4.5-Air"

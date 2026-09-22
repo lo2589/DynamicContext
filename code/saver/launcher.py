@@ -39,13 +39,15 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE = REPO_ROOT / "config" / "standard" / "runtime.yaml"
 TASKS_DIR = REPO_ROOT / "task"
 LAUNCHER_PORT = 8775
+# Where the viewer port search starts when a task has never named one.
+DEFAULT_VIEWER_PORT = 8777
 
 
 def _default_task_name() -> str:
     return time.strftime("run_%m%d_%H%M")
 
 
-def _free_port(preferred: int = 8777) -> int:
+def _free_port(preferred: int = DEFAULT_VIEWER_PORT) -> int:
     """First viewer port not already claimed by a live session."""
     import socket
 
@@ -57,6 +59,56 @@ def _free_port(preferred: int = 8777) -> int:
                 continue
             return port
     return preferred
+
+
+def _declared_port(yaml_path: Path) -> int:
+    """The viewer port this task's own YAML already names.
+
+    A conversation that comes back should come back where it was: its port is
+    what every link to it says. Reshuffling every reopened task down to the
+    lowest free number moves them out from under whoever had one open, for no
+    reason other than that the search always started at the same place.
+    `_free_port` still has the last word — if something else took it in the
+    meantime the next free port is used, and the YAML records the move.
+    """
+
+    if not yaml_path.is_file():
+        return DEFAULT_VIEWER_PORT
+    try:
+        from ..dataset.load_config import load_config
+
+        viewer = (load_config(yaml_path).to_dict().get("runtime") or {}).get("viewer") or {}
+        return int(viewer.get("port") or DEFAULT_VIEWER_PORT)
+    except Exception:  # noqa: BLE001 - an unreadable YAML just has no opinion
+        return DEFAULT_VIEWER_PORT
+
+
+def _wait_until_serving(
+    port: int, process: subprocess.Popen, *, seconds: float = 20.0
+) -> bool:
+    """Wait until the run answers on its port, or until it plainly never will.
+
+    Handing back a URL is a promise that there is something at the other end:
+    the caller's very next act is to point a browser at it. `ensure_launcher`
+    already waits like this for the panel; a run takes longer to come up — it
+    reads its YAML, rebuilds state from the ledger, reaches its provider — so
+    the wait is longer, and it watches the process too: one that died on
+    startup will never bind, and sitting out the timeout for it turns a
+    reportable failure into a blank page.
+    """
+
+    import socket
+
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        with socket.socket() as probe:
+            probe.settimeout(0.3)
+            if probe.connect_ex(("127.0.0.1", port)) == 0:
+                return True
+        if process.poll() is not None:
+            return False
+        time.sleep(0.15)
+    return False
 
 
 def _options() -> dict[str, Any]:
@@ -516,10 +568,10 @@ def create_run(payload: dict) -> dict:
         config_name = f"{task}.json"
         save_provider_config(config, config_name)
 
-    port = int(payload.get("port") or _free_port())
     task_dir = TASKS_DIR / task
     yaml_path = task_dir / "runtime.yaml"
     history_path = task_dir / "history.jsonl"
+    port = int(payload.get("port") or _free_port(_declared_port(yaml_path)))
 
     # A run is a (yaml, history) pair. A ledger with no YAML beside it cannot
     # be continued here: whatever declarations produced those turns are gone,
@@ -618,6 +670,10 @@ def create_run(payload: dict) -> dict:
         "url": f"http://127.0.0.1:{port}/",
         "pid": process.pid,
         "resumed": resuming,
+        # Whether that URL is answering yet. The caller redirects to it, and a
+        # redirect into a refused connection is indistinguishable from the
+        # switch having done nothing at all.
+        "serving": _wait_until_serving(port, process),
     }
 
 

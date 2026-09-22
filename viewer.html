@@ -209,6 +209,10 @@ const SAMPLES = {"v4_drop_ori__family_01_carter": {"label": "v4_drop_ori · fami
 const PROTO = new Set(["system","user","assistant"]);
 const ORDER = ["system","instruction","goal","constraint","user","recall","think","tool","assistant","pin","summary"];
 let model = null, t = 0, timer = null;
+// A generating turn has already selected its prompt in memory, while the
+// append-only history file is still one phase behind. live.js installs that
+// pre-provider snapshot here so all panes use one visibility source.
+let liveContext = null;
 
 const $  = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
@@ -226,6 +230,30 @@ function visibleAt(range, turn){
     if (!iv) return false;
     const a = iv[0], b = iv[1];
     return a <= turn && (b === null || b === undefined || turn <= b);
+  });
+}
+
+function viewTurns(){
+  if (!model) return [];
+  const turns = model.turns.slice();
+  if (liveContext && !turns.includes(liveContext.turn)) turns.push(liveContext.turn);
+  return turns.sort(function(a,b){ return a - b; });
+}
+
+function cellIsLive(c){
+  if (liveContext && t === liveContext.turn)
+    return liveContext.keys.has(cellKey(c));
+  return visibleAt(c.r, t);
+}
+
+function virtualLiveCells(){
+  if (!liveContext || t !== liveContext.turn) return [];
+  return liveContext.slots.filter(function(slot){
+    return !model.cells.some(function(c){
+      return c.t === slot.turn && c.e === slot.element;
+    });
+  }).map(function(slot){
+    return { t: slot.turn, e: slot.element, k: kindOf(slot.element), c: "", r: [] };
   });
 }
 
@@ -266,7 +294,7 @@ function parse(text){
    summary gets a column of its own, right after the turn it covers up to. */
 function columns(upto){
   const out = [];
-  model.turns.filter(function(x){ return x <= upto; }).forEach(function(x){
+  viewTurns().filter(function(x){ return x <= upto; }).forEach(function(x){
     out.push({ t: x, sum: false });
     if (model.cells.some(function(c){ return c.k === "summary" && c.t === x; }))
       out.push({ t: x, sum: true });
@@ -276,6 +304,9 @@ function columns(upto){
 
 function renderGrid(){
   const shown = columns(t);
+  const virtual = virtualLiveCells();
+  const gridCells = model.cells.concat(virtual);
+  const kinds = Array.from(new Set(model.kinds.concat(virtual.map(function(c){ return c.k; }))));
   $("head").innerHTML = '<th class="kind thead">slot</th>' + shown.map(function(col){
     if (col.sum)
       return '<th class="col sumcol" title="a compaction ran here; the summary covers turns up to '
@@ -283,19 +314,19 @@ function renderGrid(){
     return '<th class="col' + (col.t === t ? " playhead" : "") + '">' + col.t + '</th>';
   }).join("");
 
-  $("rows").innerHTML = model.kinds.map(function(k){
+  $("rows").innerHTML = kinds.map(function(k){
     const tds = shown.map(function(col){
       const x = col.t;
       let here;
       if (col.sum) here = (k === "summary")
-        ? model.cells.filter(function(c){ return c.k === "summary" && c.t === x; }) : [];
+        ? gridCells.filter(function(c){ return c.k === "summary" && c.t === x; }) : [];
       else here = (k === "summary") ? []
-        : model.cells.filter(function(c){ return c.k === k && c.t === x; });
+        : gridCells.filter(function(c){ return c.k === k && c.t === x; });
 
       const base = col.sum ? "col sumcol" : ("col" + (x === t ? " playhead" : ""));
       if (!here.length) return '<td class="' + base + '"><div class="dot"></div></td>';
 
-      const live = here.filter(function(c){ return visibleAt(c.r, t); }).length;
+      const live = here.filter(cellIsLive).length;
       const cls = live ? ((x === t && !col.sum) ? "dot live now" : "dot live") : "dot kept";
       const n = here.length > 1 ? here.length : "";
       return '<td class="' + base + '"><div class="' + cls + '">' + n + '</div></td>';
@@ -303,7 +334,7 @@ function renderGrid(){
     return '<tr><th class="kind">' + esc(k) + '</th>' + tds + '</tr>';
   }).join("");
 
-  $("g-note").textContent = model.kinds.length + " kinds · " + shown.length + " columns";
+  $("g-note").textContent = kinds.length + " kinds · " + shown.length + " columns";
 }
 
 /* A record's text never changes once written. What changes as you move
@@ -328,6 +359,19 @@ function bubble(c, live){
     ? '<span class="tag">' + esc(tagText(c, live)) + '</span>' : "";
   return '<div class="b ' + cls + (live ? "" : " fade") + '">' + tag
     + (esc(c.c) || "<i>(empty)</i>") + '</div>';
+}
+
+/* One row of the context pane. Both sources go through this — the ledger
+   projection for a turn already on disk, and the pre-provider snapshot for
+   the turn in flight — so the pane cannot restyle itself the instant a turn
+   commits. The only difference between the two states is then which slots
+   are on the list, which is the difference actually being shown. */
+function ctxRow(row){
+  const proto = PROTO.has(row.element);
+  const who = (proto ? esc(row.element) : "system")
+    + (proto ? "" : " · [" + esc(row.element) + "]");
+  return '<div class="cmsg"><span class="who">' + who + '</span>'
+    + (esc(row.content) || "<i>(empty)</i>") + '</div>';
 }
 
 function nodeFrom(html){
@@ -390,6 +434,45 @@ function resetChatToLatest(){
   // else — and only correct for the divider in the first case.
 }
 
+/* The playhead is the whole point of this grid, and on a long conversation it
+   is off the right-hand edge: a turn is 22px, so somewhere past the fiftieth
+   the current turn stops being on screen — and nothing ever brought it back.
+   Not opening the page, not sending, not the arrows; scrollLeft sat at 0
+   while the marker moved further away every turn.
+
+   This is the horizontal half of the rule the transcript already follows: the
+   pane moves when the playhead moves, by as little as that takes, and never
+   on a redraw that left the playhead where it was. The slot-name column is
+   sticky, so the left edge that counts is its right edge and not the pane's
+   — a column tucked in behind it is just as invisible as one past the end. */
+function playheadBox(){
+  const grid = document.querySelector(".gridscroll");
+  const cell = grid && grid.querySelector("th.playhead");
+  if (!cell) return null;
+  const pane = grid.getBoundingClientRect();
+  const name = grid.querySelector("th.kind");
+  return {
+    grid: grid,
+    left: name ? Math.max(pane.left, name.getBoundingClientRect().right) : pane.left,
+    right: pane.right,
+    box: cell.getBoundingClientRect()
+  };
+}
+
+/* No playhead drawn yet counts as watching it: that is the first paint, and
+   there is nothing the reader could have scrolled away from. */
+function playheadInView(){
+  const at = playheadBox();
+  return !at || (at.box.left >= at.left - 0.5 && at.box.right <= at.right + 0.5);
+}
+
+function revealPlayhead(){
+  const at = playheadBox();
+  if (!at) return;
+  if (at.box.left < at.left) at.grid.scrollLeft -= at.left - at.box.left;
+  else if (at.box.right > at.right) at.grid.scrollLeft += at.box.right - at.right;
+}
+
 let openedAtNewest = false;
 
 function render(){
@@ -401,11 +484,15 @@ function render(){
   const ctxTop = ctxPane ? ctxPane.scrollTop : 0;
   const gridLeft = grid ? grid.scrollLeft : 0;
   $("turnno").textContent = t;
-  $("scrub").value = model.turns.indexOf(t);
+  const turns = viewTurns();
+  $("scrub").max = Math.max(0, turns.length - 1);
+  $("scrub").value = turns.indexOf(t);
   renderGrid();
 
   const past = model.cells.filter(function(c){ return c.t <= t; });
-  const live = past.filter(function(c){ return visibleAt(c.r, t); });
+  const virtual = virtualLiveCells();
+  const counted = past.concat(virtual);
+  const live = counted.filter(cellIsLive);
 
   /* Redrawing the whole transcript was never necessary and was charged for
      twice: the scroll offset had to be saved and restored around every draw,
@@ -436,11 +523,11 @@ function render(){
     let node = chatNodes.get(w.key);
     if (!node){
       node = nodeFrom(w.cell
-        ? bubble(w.cell, visibleAt(w.cell.r, t))
+        ? bubble(w.cell, cellIsLive(w.cell))
         : '<div class="turnmark">turn ' + w.turn + '</div>');
       chatNodes.set(w.key, node);
     } else if (w.cell){
-      setBubbleLive(node, w.cell, visibleAt(w.cell.r, t));
+      setBubbleLive(node, w.cell, cellIsLive(w.cell));
     }
     if (node === cursor) cursor = node.nextSibling;
     else chat.insertBefore(node, cursor);
@@ -448,18 +535,16 @@ function render(){
   $("h-count").textContent = past.length + " slots · "
     + past.filter(function(c){ return c.e === "user"; }).length + " exchanges";
 
-  $("c-count").textContent = live.length;
-  $("ctx").innerHTML = live.map(function(c){
-    const role = PROTO.has(c.e) ? c.e : "system";
-    const lab  = PROTO.has(c.e) ? "" : " · [" + esc(c.e) + "]";
-    return '<div class="cmsg"><span class="who">' + role + lab + '</span>'
-      + (esc(c.c) || "<i>(empty)</i>") + '</div>';
-  }).join("");
+  const ctxRows = (liveContext && t === liveContext.turn)
+    ? liveContext.rows
+    : live.map(function(c){ return { element: c.e, content: c.c }; });
+  $("c-count").textContent = ctxRows.length;
+  $("ctx").innerHTML = ctxRows.map(ctxRow).join("");
 
-  $("s-total").textContent = past.length;
+  $("s-total").textContent = counted.length;
   $("s-live").textContent  = live.length;
-  $("s-gone").textContent  = past.length - live.length;
-  $("s-ratio").textContent = past.length ? Math.round(live.length / past.length * 100) + "%" : "0%";
+  $("s-gone").textContent  = counted.length - live.length;
+  $("s-ratio").textContent = counted.length ? Math.round(live.length / counted.length * 100) + "%" : "0%";
 
   if (ctxPane) ctxPane.scrollTop = ctxTop;
   if (grid) grid.scrollLeft = gridLeft;
@@ -483,18 +568,160 @@ function load(text, label, startTurn){
   let m;
   try { m = parse(text); }
   catch (err){ $("src").textContent = "Could not read it — " + err.message; $("src").className = "src bad"; return; }
+  // Following the newest turn is what a live view does — but only for a
+  // reader who is standing at the newest turn. Someone who scrubbed back to
+  // read turn 2 asked to be there, and a turn committing at the other end of
+  // the ledger is not a reason to take it away from them. Measured before
+  // the model is replaced, because viewTurns() is answered by whichever one
+  // is installed.
+  const following = startTurn === "last";
+  const seen = viewTurns();
+  const parked = following && !!model && seen.length > 0 && t !== seen[seen.length - 1];
   model = m;
   $("src").className = "src";
   $("src").textContent = label + " — " + m.turns.length + " turns · " + m.cells.length
     + " slots · " + m.kinds.length + " kinds";
-  $("scrub").max = m.turns.length - 1;
-  setTurn(startTurn === "last" ? m.turns.length - 1 : (startTurn || 0));
+  $("scrub").max = viewTurns().length - 1;
+  const stay = parked ? viewTurns().indexOf(t) : -1;
+  setTurn(
+    stay >= 0 ? stay : (following ? viewTurns().length - 1 : (startTurn || 0)),
+    following ? "commit" : undefined
+  );
 }
 
-function setTurn(i){
-  t = model.turns[Math.max(0, Math.min(model.turns.length - 1, i))];
+function setTurn(i, reason){
+  const turns = viewTurns();
+  const next = turns[Math.max(0, Math.min(turns.length - 1, i))];
+  const moved = next !== t;
+  // Asked before the redraw, because the redraw is what moves it.
+  const watching = playheadInView();
+  t = next;
   render();
+  // Only where the playhead actually moved — a redraw that left it alone is
+  // no reason to pull the pane out from under anyone. And when a turn
+  // committing moved it rather than the reader, chase it only for a reader
+  // who was watching it: someone who scrolled off to look at turn 10 is
+  // looking at turn 10. Same rule the transcript keeps vertically.
+  if (moved && (reason !== "commit" || watching)) revealPlayhead();
 }
+
+/* What the next turn will look like, computed from the ledger this page is
+   already holding. state = π(流, 声明): a record's own interval decides
+   whether it is still in context at turn N+1 exactly as it does at any turn
+   already on disk, so all three panes can say what this turn is the moment
+   you send it, instead of waiting to be told. The server's own snapshot
+   replaces this as soon as it arrives and normally says the same thing;
+   where it differs — a patch materialising, a recall hit, a compaction —
+   that difference is this turn's news, not the correction of a guess. */
+window.projectPendingTurn = function(userText){
+  if (!model || !model.turns.length) return null;
+  const turn = Math.max.apply(null, model.turns) + 1;
+  const slots = [], sent = [];
+  model.cells.forEach(function(c){
+    if (!visibleAt(c.r, turn)) return;
+    slots.push({ turn: c.t, element: c.e });
+    sent.push({ role: PROTO.has(c.e) ? c.e : "system", content: c.c });
+  });
+  slots.push({ turn: turn, element: "user" });
+  sent.push({ role: "user", content: String(userText || "") });
+  return { turn: turn, slots: slots, messages: sent };
+};
+
+/* An element with no declared role reaches the model as a system message
+   headed "[element]" (code/manager/context.py's _message_for_element). This
+   pane prints that name in a column of its own, so the copy inside the body
+   is the projection showing through — drop it, and only where it is really
+   there. */
+function unlabel(element, content){
+  const head = "[" + element + "]\n";
+  return content.slice(0, head.length) === head ? content.slice(head.length) : content;
+}
+
+/* A slot's identity plus how much it says. Content is written once and never
+   edited, so this changes exactly when the snapshot means something new —
+   which is the only time the panes need redrawing. Re-installing an
+   identical snapshot every 750ms was replacing the grid and the context pane
+   wholesale while you were reading them. */
+function snapshotSignature(turn, rows){
+  return turn + "|" + rows.map(function(row){
+    return row.element + ":" + row.content.length;
+  }).join(",");
+}
+
+/* The pre-provider truth for the turn being generated: which slots the
+   server selected, and — for the ones it created this turn, which are not on
+   disk yet — what they say. Everything else reads its content from the
+   ledger the page already has, so a row does not change appearance when the
+   same slot is later drawn from history instead.
+
+   pending_context and pending_slots come out of the same single walk over
+   one state table (code/manager/context.py's select_context_without_extra_filter
+   is the identical loop to runtime.py's pending_slots), so index i is the
+   same slot in both. If that ever stops holding, the pairing is dropped
+   rather than guessed at. */
+window.setLiveContextSnapshot = function(turn, slots, messages){
+  const pending = Number(turn);
+  // A snapshot describes the turn being generated. Once that turn is on the
+  // ledger it is history, and the panes read it from there. Without this, a
+  // /streaming reply already in flight when the turn committed lands a moment
+  // later and puts all three panes back onto a turn the ledger has already
+  // superseded — including dragging the grid to where that turn's column was
+  // before the commit added a compaction column and moved it.
+  if (model && model.turns.indexOf(pending) !== -1) return;
+  const normalized = (slots || []).map(function(slot){
+    return { turn: Number(slot.turn), element: String(slot.element) };
+  });
+  const sent = messages || [];
+  const paired = sent.length === normalized.length;
+  const known = new Map();
+  if (model) model.cells.forEach(function(c){ known.set(cellKey(c), c.c); });
+  const rows = normalized.map(function(slot, i){
+    const key = cellKey({ t: slot.turn, e: slot.element });
+    if (known.has(key)) return { element: slot.element, content: known.get(key) };
+    const said = paired ? String(sent[i].content || "") : "";
+    return { element: slot.element, content: unlabel(slot.element, said) };
+  });
+  // Nothing new to say. Not even the playhead moves: a snapshot is published
+  // once per turn and never edited, so an identical one arriving 750ms later
+  // is the same poll, not a second event — and dragging the scrubber back to
+  // this turn on every poll is what made a turn unreadable while the next
+  // one was being generated.
+  const signature = snapshotSignature(pending, rows);
+  if (liveContext && liveContext.signature === signature) return;
+  // A correction to the turn already on show is not the playhead moving: the
+  // server adding a slot this page could not have predicted redraws the
+  // panes, it does not re-aim them.
+  const arrived = !liveContext || liveContext.turn !== pending;
+  liveContext = {
+    turn: pending,
+    slots: normalized,
+    keys: new Set(normalized.map(function(slot){
+      return cellKey({ t: slot.turn, e: slot.element });
+    })),
+    rows: rows,
+    signature: signature
+  };
+  t = liveContext.turn;
+  render();
+  // The send moves the playhead onto a column that did not exist a moment
+  // ago — the far end of the grid, which is exactly where it cannot be seen.
+  if (arrived) revealPlayhead();
+};
+
+/* Whether the ledger this page has loaded already contains a turn. live.js
+   asks about the turn it is holding provisional bubbles for: the moment the
+   real ones exist, its copy is a duplicate. */
+window.ledgerHasTurn = function(turn){
+  return !!model && model.turns.indexOf(Number(turn)) !== -1;
+};
+
+window.clearLiveContextSnapshot = function(){
+  if (!liveContext) return;
+  liveContext = null;
+  const turns = viewTurns();
+  if (!turns.includes(t)) t = turns[turns.length - 1];
+  render();
+};
 function stop(){
   if (timer) clearInterval(timer);
   timer = null;
@@ -507,13 +734,14 @@ $("play").onclick = function(){
   $("play").setAttribute("aria-pressed","true");
   $("play").textContent = "⏸ Pause";
   timer = setInterval(function(){
-    const i = model.turns.indexOf(t);
-    if (i >= model.turns.length - 1) return stop();
+    const turns = viewTurns();
+    const i = turns.indexOf(t);
+    if (i >= turns.length - 1) return stop();
     setTurn(i + 1);
   }, 900);
 };
-$("prev").onclick   = function(){ stop(); setTurn(model.turns.indexOf(t) - 1); };
-$("next").onclick   = function(){ stop(); setTurn(model.turns.indexOf(t) + 1); };
+$("prev").onclick   = function(){ stop(); setTurn(viewTurns().indexOf(t) - 1); };
+$("next").onclick   = function(){ stop(); setTurn(viewTurns().indexOf(t) + 1); };
 $("scrub").oninput  = function(e){ stop(); setTurn(+e.target.value); };
 addEventListener("keydown", function(e){
   // 守卫必须覆盖所有可输入控件，不只是 INPUT：输入框是 TEXTAREA，在里面按
@@ -521,8 +749,8 @@ addEventListener("keydown", function(e){
   // 每按一下整页重绘一轮——就是"输入时滚轴乱跳"的来源。下拉框同理。
   const tag = e.target.tagName;
   if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || e.target.isContentEditable) return;
-  if (e.key === "ArrowLeft"){ stop(); setTurn(model.turns.indexOf(t) - 1); }
-  if (e.key === "ArrowRight"){ stop(); setTurn(model.turns.indexOf(t) + 1); }
+  if (e.key === "ArrowLeft"){ stop(); setTurn(viewTurns().indexOf(t) - 1); }
+  if (e.key === "ArrowRight"){ stop(); setTurn(viewTurns().indexOf(t) + 1); }
 });
 
 function pick(k){
