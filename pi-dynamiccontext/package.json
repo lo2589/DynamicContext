@@ -2,22 +2,45 @@
   "name": "pi-dynamiccontext",
   "version": "0.1.0",
   "description": "Declarative lifecycle rules over an append-only slot ledger, as a pi extension",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "context-management",
+    "context-lifecycle"
+  ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lo2589/DynamicContext.git",
+    "directory": "pi-dynamiccontext"
+  },
+  "homepage": "https://github.com/lo2589/DynamicContext/tree/main/pi-dynamiccontext",
+  "bugs": "https://github.com/lo2589/DynamicContext/issues",
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE",
+    "tsconfig.json"
+  ],
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": [
+      "./extensions"
+    ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.87.0",
+    "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.87.1",
+    "@types/node": "^22",
     "typebox": "*",
-    "typescript": "^5",
-    "@types/node": "^22"
+    "typescript": "^5"
   },
   "scripts": {
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "yaml": "^2.9.0"
   }
 }

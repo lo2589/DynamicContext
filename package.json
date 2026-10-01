@@ -1,0 +1,22 @@
+{
+  "name": "pi-dynamiccontext",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Repository-root pi manifest so `pi install git:github.com/lo2589/DynamicContext` loads pi-dynamiccontext",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./pi-dynamiccontext/extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "dependencies": {
+    "yaml": "^2.9.0"
+  }
+}
