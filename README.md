@@ -16,7 +16,7 @@ Provider 最终收到的仍是标准 `system` / `user` / `assistant` 消息。�
 同一套生命周期层也是 [pi](https://pi.dev) 的扩展包，一条命令安装：
 
 ```bash
-pi install git:github.com/lo2589/DynamicContext
+pi install npm:pi-dynamiccontext
 ```
 
 说明见 [pi-dynamiccontext/README.md](pi-dynamiccontext/README.md)。
